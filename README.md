@@ -106,6 +106,6 @@ mv login.html index.html
 
 🌐 Step 8: Accessing the Website
 ✅ Successfully accessed website using
-<http://54.221.25.129/>/
+http://34.227.225.159/
 
 
