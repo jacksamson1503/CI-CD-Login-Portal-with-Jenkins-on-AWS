@@ -11,7 +11,7 @@ javascript.js
 
 Verified the project works locally on the laptop.
 Pushed the code to GitHub:
-🔗 Repository: https://github.com/jacksamson1503/login_portal
+🔗 Repository: https://github.com/yourreponame/login_portal
 
 
 Step 2: AWS EC2 Setup
@@ -34,7 +34,7 @@ sudo systemctl enable apache2
 
 
 Verified by opening in browser:
-http://<EC2-Public-IP>/ ✅
+http://<EC2-Public-IP>/ 
 
 
 Step 3: Jenkins Installation & Setup
@@ -75,15 +75,15 @@ sudo apt install git -y
 
 
 Configured Git username and email:
-git config --global user.name "jacksamsom1503"
-git config --global user.email "jacksamsomc@gmail.com"
+git config --global user.name "githubname"
+git config --global user.email "yourmailid"
 
 
 🔧 Step 6: Jenkins Job Setup for Deployment
 
 Created a new Jenkins Freestyle Project named LoginPortalDeploy.
 Configured GitHub Repository URL:
-https://github.com/jacksamson1503/login_portal.git
+https://github.com/githubid/login_portal.git
 
 Build Trigger: Build Now (manual or automatic via GitHub webhook).
 
