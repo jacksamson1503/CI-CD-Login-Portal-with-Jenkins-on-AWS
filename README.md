@@ -106,6 +106,11 @@ mv login.html index.html
 
 🌐 Step 8: Accessing the Website
 ✅ Successfully accessed website using
-http://34.227.225.159/
+http://Your EC2 IP/
+
+<img width="1585" height="848" alt="image" src="https://github.com/user-attachments/assets/d78cc285-9edc-42be-8384-7b834f5a5ec1" />
+<img width="1588" height="851" alt="image" src="https://github.com/user-attachments/assets/b2c4b44b-0133-45fa-8601-db5b5f13c7fb" />
+
+
 
 
