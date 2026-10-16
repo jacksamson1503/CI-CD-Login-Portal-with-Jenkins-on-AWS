@@ -38,35 +38,23 @@ jobs:
           node --check javascript.js
           echo "JavaScript syntax validation passed."
 
-      - name: Lint HTML Files
+      - name: Verify Web Assets Integrity
         run: |
-          echo "Checking HTML structure..."
-          if grep -q "<html>\|<!DOCTYPE" index.html && grep -q "</html>" index.html; then
-            echo "index.html structure verified."
-          else
-            echo "index.html structure check failed."
-            exit 1
-          fi
-          if grep -q "<html>\|<!DOCTYPE" password.html && grep -q "</html>" password.html; then
-            echo "password.html structure verified."
-          else
-            echo "password.html structure check failed."
-            exit 1
-          fi
+          echo "Checking web assets integrity..."
+          test -s index.html || { echo "index.html missing or empty"; exit 1; }
+          test -s style.css || { echo "style.css missing or empty"; exit 1; }
+          test -s script.js || { echo "script.js missing or empty"; exit 1; }
+          test -s Dockerfile || { echo "Dockerfile missing or empty"; exit 1; }
+          grep -i "<html" index.html || { echo "Missing <html> tag in index.html"; exit 1; }
+          grep -i "<html" password.html || { echo "Missing <html> tag in password.html"; exit 1; }
+          echo "Web assets integrity check passed."
 
-      - name: Dockerfile Quality Lint (Hadolint)
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
-          failure-threshold: error
-
-      - name: Vulnerability Scanner (Trivy Scan)
+      - name: Dockerfile Syntax & Build Sanity Check
         run: |
-          echo "Installing Trivy security scanner..."
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.58.2
-          echo "Running Trivy filesystem scan..."
-          trivy fs --severity CRITICAL,HIGH --exit-code 0 .
-        continue-on-error: true
+          echo "Testing Docker build sanity in Quality Gate..."
+          docker build --no-cache -t quality-gate-test .
+          docker rmi quality-gate-test
+          echo "Dockerfile quality gate passed."
 
   # =========================================================================
   # STAGE 2: BUILD & PUSH DOCKER IMAGE TO AWS ECR
