@@ -3,7 +3,7 @@ let index = 0;
 
 function typeWriter() {
     const target = document.getElementById("typewriter");
-    if (index < objectiveText.length) {
+    if (target && index < objectiveText.length) {
         target.innerHTML += objectiveText.charAt(index);
         index++;
         setTimeout(typeWriter, 50);
@@ -15,9 +15,11 @@ document.addEventListener("DOMContentLoaded", () => {
     
     // Contact Form Logic
     const form = document.getElementById('contact-form');
-    form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        alert("Execution Success: Message received by Cloud Infrastructure.");
-        form.reset();
-    });
+    if (form) {
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            alert("Execution Success: Message received by Cloud Infrastructure.");
+            form.reset();
+        });
+    }
 });

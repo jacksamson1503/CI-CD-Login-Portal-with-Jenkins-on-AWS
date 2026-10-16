@@ -1,0 +1,297 @@
+name: Production CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY || 'login-portal' }}
+  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:181188392988:aws-daily-operations-report
+  CONTAINER_NAME: login-portal
+
+jobs:
+  # =========================================================================
+  # STAGE 1: QUALITY GATE & STATIC ANALYSIS
+  # =========================================================================
+  quality-gate:
+    name: 🛡️ Quality Gate & Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 🔍 Validate JavaScript Syntax
+        run: |
+          echo "Validating JavaScript files..."
+          node --check script.js
+          node --check javascript.js
+          echo "✅ JavaScript syntax validation passed."
+
+      - name: 🔍 Lint HTML Files
+        run: |
+          echo "Checking HTML structure..."
+          if grep -q "<html>\|<!DOCTYPE" index.html && grep -q "</html>" index.html; then
+            echo "✅ index.html structure verified."
+          else
+            echo "❌ index.html structure check failed."
+            exit 1
+          fi
+          if grep -q "<html>\|<!DOCTYPE" password.html && grep -q "</html>" password.html; then
+            echo "✅ password.html structure verified."
+          else
+            echo "❌ password.html structure check failed."
+            exit 1
+          fi
+
+      - name: 🐳 Dockerfile Quality Lint (Hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+          ignore: DL3018 # Allow alpine apk without pinned versions
+
+      - name: 🔒 Vulnerability Scanner (Trivy Repository Scan)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0' # Non-blocking alert for repository dependencies
+
+  # =========================================================================
+  # STAGE 2: BUILD & PUSH DOCKER IMAGE TO AWS ECR
+  # =========================================================================
+  build-and-push:
+    name: 📦 Build & Store Image in AWS ECR
+    needs: [quality-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔐 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v4
+
+      - name: 🏷️ Generate Image Tag
+        id: set-tag
+        run: |
+          IMAGE_TAG="${{ github.sha }}"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: 🏗️ Build, Tag, and Push Docker Image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
+        run: |
+          echo "Building Docker image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
+          
+          echo "Pushing images to Amazon ECR..."
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Docker image stored in ECR successfully."
+
+  # =========================================================================
+  # STAGE 3: DEPLOY TO AWS EC2 WITH AUTOMATIC ROLLBACK
+  # =========================================================================
+  deploy:
+    name: 🚀 Deploy to EC2 with Automated Rollback
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🌐 SSH to EC2 & Execute Production Deployment
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,AWS_REGION,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,CONTAINER_NAME
+          script_stop: true
+          script: |
+            set -e
+            echo "=========================================================="
+            echo "🚀 STARTING REAL-TIME PRODUCTION DEPLOYMENT"
+            echo "Target Image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            echo "=========================================================="
+
+            # Step 1: AWS ECR Authentication on EC2
+            echo "Step 1: Authenticating Docker with Amazon ECR..."
+            export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+            export AWS_DEFAULT_REGION="$AWS_REGION"
+            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            # Step 2: Pull New Image
+            echo "Step 2: Pulling new image from ECR..."
+            docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+            # Step 3: Backup existing container for instant rollback
+            echo "Step 3: Staging existing container for rollback safeguard..."
+            BACKUP_CONTAINER="${CONTAINER_NAME}-backup"
+            
+            # Remove any previous stale backup
+            docker rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
+
+            # If active container exists, rename it to backup and stop
+            HAS_PREVIOUS="false"
+            if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+              echo "Active container found. Renaming to $BACKUP_CONTAINER..."
+              docker stop "$CONTAINER_NAME"
+              docker rename "$CONTAINER_NAME" "$BACKUP_CONTAINER"
+              HAS_PREVIOUS="true"
+            elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+              docker rm -f "$CONTAINER_NAME"
+            fi
+
+            # Step 4: Run New Container
+            echo "Step 4: Launching new container ($CONTAINER_NAME)..."
+            docker run -d \
+              --name "$CONTAINER_NAME" \
+              -p 80:80 \
+              --restart unless-stopped \
+              "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+            # Step 5: Automated Health Check with Auto-Rollback
+            echo "Step 5: Verifying container health..."
+            HEALTH_CHECK_PASSED="false"
+            for i in 1 2 3 4 5; do
+              sleep 4
+              if curl -s -f --connect-timeout 3 http://localhost:80/index.html > /dev/null 2>&1 || curl -s -f --connect-timeout 3 http://localhost:80/ > /dev/null 2>&1; then
+                echo "✅ Health check attempt $i: PASSED! Web portal is responding."
+                HEALTH_CHECK_PASSED="true"
+                break
+              else
+                echo "⚠️ Health check attempt $i: Waiting for container response..."
+              fi
+            done
+
+            # Step 6: Rollback Evaluation
+            if [ "$HEALTH_CHECK_PASSED" != "true" ]; then
+              echo "❌ CRITICAL: Health check FAILED! Stopping pipeline and initiating automatic rollback..."
+              docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+              
+              if [ "$HAS_PREVIOUS" = "true" ]; then
+                echo "🔄 Restoring previous working container ($BACKUP_CONTAINER -> $CONTAINER_NAME)..."
+                docker rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
+                docker start "$CONTAINER_NAME"
+                echo "✅ Rollback successful: Previous working version restored and serving traffic."
+              else
+                echo "⚠️ No previous running container was available to restore."
+              fi
+              exit 1
+            fi
+
+            # Cleanup backup container on success
+            echo "Step 7: Deployment verified healthy. Cleaning up backup container..."
+            docker rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
+            echo "=========================================================="
+            echo "🎉 PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
+            echo "=========================================================="
+
+  # =========================================================================
+  # STAGE 4: AWS SNS NOTIFICATION (ALWAYS RUNS ON SUCCESS OR FAILURE)
+  # =========================================================================
+  notify-sns:
+    name: 📢 Send SNS Operations Report
+    needs: [quality-gate, build-and-push, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔑 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 📨 Publish Notification to AWS SNS
+        env:
+          QG_STATUS: ${{ needs.quality-gate.result }}
+          BUILD_STATUS: ${{ needs.build-and-push.result }}
+          DEPLOY_STATUS: ${{ needs.deploy.result }}
+          WORKFLOW_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Determine overall pipeline outcome
+          if [ "$QG_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
+            OVERALL_STATUS="SUCCESSFUL"
+            SUBJECT="[CI/CD SUCCESS] Production Deployment Succeeded - ${{ github.repository }}"
+            SUMMARY="All stages passed successfully. The new Docker container is running and healthy on EC2."
+          else
+            OVERALL_STATUS="FAILED"
+            SUBJECT="[CI/CD FAILURE / ROLLBACK] Deployment Alert - ${{ github.repository }}"
+            SUMMARY="The pipeline encountered a failure and was halted. If deployment failed during health checks, the automated rollback mechanism was executed on EC2 to restore the previous working version."
+          fi
+
+          # Construct clean plain text message body for SNS email
+          MESSAGE=$(cat <<EOF
+==================================================================
+AWS CI/CD PIPELINE OPERATIONS REPORT
+==================================================================
+
+Overall Status     : $OVERALL_STATUS
+Repository         : ${{ github.repository }}
+Branch             : ${{ github.ref_name }}
+Commit SHA         : ${{ github.sha }}
+Triggered By       : ${{ github.actor }}
+Workflow Run       : $WORKFLOW_RUN_URL
+
+------------------------------------------------------------------
+STAGE-BY-STAGE EXECUTION BREAKDOWN
+------------------------------------------------------------------
+1. Quality Gate & Security Scan : $QG_STATUS
+2. Build & Amazon ECR Push      : $BUILD_STATUS
+3. AWS EC2 Deployment & Rollback: $DEPLOY_STATUS
+
+------------------------------------------------------------------
+OPERATIONAL DETAILS
+------------------------------------------------------------------
+$SUMMARY
+
+Target AWS Region  : ${{ env.AWS_REGION }}
+SNS Topic ARN      : ${{ env.SNS_TOPIC_ARN }}
+Report Timestamp   : $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+==================================================================
+This is an automated notification from GitHub Actions CI/CD.
+==================================================================
+EOF
+          )
+
+          echo "Publishing to SNS: ${{ env.SNS_TOPIC_ARN }}"
+          aws sns publish \
+            --topic-arn "${{ env.SNS_TOPIC_ARN }}" \
+            --subject "$SUBJECT" \
+            --message "$MESSAGE"
+
+          echo "✅ AWS SNS Notification sent successfully."
