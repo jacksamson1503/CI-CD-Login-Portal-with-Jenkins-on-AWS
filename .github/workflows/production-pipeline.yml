@@ -96,7 +96,10 @@ jobs:
           IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
           CUSTOM_ECR_REPO: ${{ secrets.ECR_REPOSITORY }}
         run: |
-          TARGET_REPO="${CUSTOM_ECR_REPO:-$ECR_REPOSITORY}"
+          TARGET_REPO="${CUSTOM_ECR_REPO:-login-portal}"
+          if [ -z "$TARGET_REPO" ]; then
+            TARGET_REPO="login-portal"
+          fi
           echo "Building Docker image: $ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
           docker build -t "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" -t "$ECR_REGISTRY/$TARGET_REPO:latest" .
           
@@ -116,65 +119,80 @@ jobs:
     needs: [build-and-push]
     runs-on: ubuntu-latest
     steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate ECR Auth Token for EC2
+        id: ecr-token
+        run: |
+          TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
       - name: SSH to EC2 & Execute Production Deployment
         uses: appleboy/ssh-action@v1.0.3
         env:
           ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository }}
+          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository || 'login-portal' }}
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          AWS_REGION: ${{ env.AWS_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,AWS_REGION,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,CONTAINER_NAME
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ECR_TOKEN,CONTAINER_NAME
           script_stop: true
           script: |
             set -e
             echo "=========================================================="
             echo "STARTING REAL-TIME PRODUCTION DEPLOYMENT"
-            echo "Target Image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
+
+            # Auto-detect docker command
+            if docker info > /dev/null 2>&1; then
+              DOCKER_CMD="docker"
+            else
+              DOCKER_CMD="sudo docker"
+            fi
 
             # Step 1: AWS ECR Authentication on EC2
             echo "Step 1: Authenticating Docker with Amazon ECR..."
-            export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
-            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
-            export AWS_DEFAULT_REGION="$AWS_REGION"
-            aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+            echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
 
             # Step 2: Pull New Image
             echo "Step 2: Pulling new image from ECR..."
-            docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            $DOCKER_CMD pull "$TARGET_IMAGE"
 
             # Step 3: Backup existing container for instant rollback
             echo "Step 3: Staging existing container for rollback safeguard..."
             BACKUP_CONTAINER="${CONTAINER_NAME}-backup"
             
-            # Remove any previous stale backup
-            docker rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
+            $DOCKER_CMD rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
 
-            # If active container exists, rename it to backup and stop
             HAS_PREVIOUS="false"
-            if [ "$(docker ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
+            if [ "$($DOCKER_CMD ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
               echo "Active container found. Renaming to $BACKUP_CONTAINER..."
-              docker stop "$CONTAINER_NAME"
-              docker rename "$CONTAINER_NAME" "$BACKUP_CONTAINER"
+              $DOCKER_CMD stop "$CONTAINER_NAME"
+              $DOCKER_CMD rename "$CONTAINER_NAME" "$BACKUP_CONTAINER"
               HAS_PREVIOUS="true"
-            elif [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-              docker rm -f "$CONTAINER_NAME"
+            elif [ "$($DOCKER_CMD ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
+              $DOCKER_CMD rm -f "$CONTAINER_NAME"
             fi
 
             # Step 4: Run New Container
             echo "Step 4: Launching new container ($CONTAINER_NAME)..."
-            docker run -d \
+            $DOCKER_CMD run -d \
               --name "$CONTAINER_NAME" \
               -p 80:80 \
               --restart unless-stopped \
-              "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+              "$TARGET_IMAGE"
 
             # Step 5: Automated Health Check with Auto-Rollback
             echo "Step 5: Verifying container health..."
@@ -193,12 +211,12 @@ jobs:
             # Step 6: Rollback Evaluation
             if [ "$HEALTH_CHECK_PASSED" != "true" ]; then
               echo "CRITICAL: Health check FAILED! Stopping pipeline and initiating automatic rollback..."
-              docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+              $DOCKER_CMD rm -f "$CONTAINER_NAME" 2>/dev/null || true
               
               if [ "$HAS_PREVIOUS" = "true" ]; then
                 echo "Restoring previous working container ($BACKUP_CONTAINER -> $CONTAINER_NAME)..."
-                docker rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
-                docker start "$CONTAINER_NAME"
+                $DOCKER_CMD rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
+                $DOCKER_CMD start "$CONTAINER_NAME"
                 echo "Rollback successful: Previous working version restored and serving traffic."
               else
                 echo "No previous running container was available to restore."
@@ -208,7 +226,7 @@ jobs:
 
             # Cleanup backup container on success
             echo "Step 7: Deployment verified healthy. Cleaning up backup container..."
-            docker rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
+            $DOCKER_CMD rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
             echo "=========================================================="
             echo "PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
             echo "=========================================================="
