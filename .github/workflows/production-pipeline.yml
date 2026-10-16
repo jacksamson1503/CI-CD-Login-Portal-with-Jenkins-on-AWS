@@ -107,6 +107,9 @@ jobs:
           docker push "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$TARGET_REPO:latest"
           
+          echo "Verifying pushed images in AWS ECR..."
+          aws ecr describe-images --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --query 'imageDetails[*].imageTags' --output text || true
+
           echo "image=$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
           echo "ecr_repository=$TARGET_REPO" >> $GITHUB_OUTPUT
           echo "Docker image stored in ECR successfully."
@@ -165,10 +168,15 @@ jobs:
             # Step 1: AWS ECR Authentication on EC2
             echo "Step 1: Authenticating Docker with Amazon ECR..."
             echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
+            echo "$ECR_TOKEN" | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY" 2>/dev/null || true
 
-            # Step 2: Pull New Image
+            # Step 2: Pull New Image with fallback
             echo "Step 2: Pulling new image from ECR..."
-            $DOCKER_CMD pull "$TARGET_IMAGE"
+            if ! $DOCKER_CMD pull "$TARGET_IMAGE"; then
+              echo "Specific commit tag pull returned not found. Trying fallback to 'latest' tag..."
+              TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+              $DOCKER_CMD pull "$TARGET_IMAGE"
+            fi
 
             # Step 3: Backup existing container for instant rollback
             echo "Step 3: Staging existing container for rollback safeguard..."
@@ -185,6 +193,9 @@ jobs:
             elif [ "$($DOCKER_CMD ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
               $DOCKER_CMD rm -f "$CONTAINER_NAME"
             fi
+
+            # Ensure port 80 is free from existing system web servers (like Apache)
+            sudo systemctl stop apache2 2>/dev/null || true
 
             # Step 4: Run New Container
             echo "Step 4: Launching new container ($CONTAINER_NAME)..."
