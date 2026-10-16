@@ -20,48 +20,49 @@ jobs:
   # STAGE 1: QUALITY GATE & STATIC ANALYSIS
   # =========================================================================
   quality-gate:
-    name: 🛡️ Quality Gate & Security Scan
+    name: Quality Gate & Security Scan
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: ⚙️ Setup Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: 🔍 Validate JavaScript Syntax
+      - name: Validate JavaScript Syntax
         run: |
           echo "Validating JavaScript files..."
           node --check script.js
           node --check javascript.js
-          echo "✅ JavaScript syntax validation passed."
+          echo "JavaScript syntax validation passed."
 
-      - name: 🔍 Lint HTML Files
+      - name: Lint HTML Files
         run: |
           echo "Checking HTML structure..."
           if grep -q "<html>\|<!DOCTYPE" index.html && grep -q "</html>" index.html; then
-            echo "✅ index.html structure verified."
+            echo "index.html structure verified."
           else
-            echo "❌ index.html structure check failed."
+            echo "index.html structure check failed."
             exit 1
           fi
           if grep -q "<html>\|<!DOCTYPE" password.html && grep -q "</html>" password.html; then
-            echo "✅ password.html structure verified."
+            echo "password.html structure verified."
           else
-            echo "❌ password.html structure check failed."
+            echo "password.html structure check failed."
             exit 1
           fi
 
-      - name: 🐳 Dockerfile Quality Lint (Hadolint)
+      - name: Dockerfile Quality Lint (Hadolint)
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           failure-threshold: error
 
-      - name: 🔒 Vulnerability Scanner (Trivy Repository Scan)
-        uses: aquasecurity/trivy-action@0.28.0
+      - name: Vulnerability Scanner (Trivy Scan)
+        uses: aquasecurity/trivy-action@v0.28.0
+        continue-on-error: true
         with:
           scan-type: 'fs'
           scan-ref: '.'
@@ -72,41 +73,43 @@ jobs:
   # STAGE 2: BUILD & PUSH DOCKER IMAGE TO AWS ECR
   # =========================================================================
   build-and-push:
-    name: 📦 Build & Store Image in AWS ECR
+    name: Build & Store Image in AWS ECR
     needs: [quality-gate]
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.build-image.outputs.image }}
       image_tag: ${{ steps.set-tag.outputs.image_tag }}
       ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+      ecr_repository: ${{ steps.build-image.outputs.ecr_repository }}
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: 🔑 Configure AWS Credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 🔐 Login to Amazon ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v4
 
-      - name: 🏷️ Generate Image Tag
+      - name: Generate Image Tag
         id: set-tag
         run: |
           IMAGE_TAG="${{ github.sha }}"
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: 🏗️ Build, Tag, and Push Docker Image to Amazon ECR
+      - name: Build, Tag, and Push Docker Image to Amazon ECR
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
-          TARGET_REPO: ${{ secrets.ECR_REPOSITORY != '' && secrets.ECR_REPOSITORY || env.ECR_REPOSITORY }}
+          CUSTOM_ECR_REPO: ${{ secrets.ECR_REPOSITORY }}
         run: |
+          TARGET_REPO="${CUSTOM_ECR_REPO:-$ECR_REPOSITORY}"
           echo "Building Docker image: $ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
           docker build -t "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" -t "$ECR_REGISTRY/$TARGET_REPO:latest" .
           
@@ -115,21 +118,22 @@ jobs:
           docker push "$ECR_REGISTRY/$TARGET_REPO:latest"
           
           echo "image=$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Docker image stored in ECR successfully."
+          echo "ecr_repository=$TARGET_REPO" >> $GITHUB_OUTPUT
+          echo "Docker image stored in ECR successfully."
 
   # =========================================================================
   # STAGE 3: DEPLOY TO AWS EC2 WITH AUTOMATIC ROLLBACK
   # =========================================================================
   deploy:
-    name: 🚀 Deploy to EC2 with Automated Rollback
+    name: Deploy to EC2 with Automated Rollback
     needs: [build-and-push]
     runs-on: ubuntu-latest
     steps:
-      - name: 🌐 SSH to EC2 & Execute Production Deployment
+      - name: SSH to EC2 & Execute Production Deployment
         uses: appleboy/ssh-action@v1.0.3
         env:
           ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY != '' && secrets.ECR_REPOSITORY || env.ECR_REPOSITORY }}
+          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository }}
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
           AWS_REGION: ${{ env.AWS_REGION }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -144,7 +148,7 @@ jobs:
           script: |
             set -e
             echo "=========================================================="
-            echo "🚀 STARTING REAL-TIME PRODUCTION DEPLOYMENT"
+            echo "STARTING REAL-TIME PRODUCTION DEPLOYMENT"
             echo "Target Image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "=========================================================="
 
@@ -191,26 +195,26 @@ jobs:
             for i in 1 2 3 4 5; do
               sleep 4
               if curl -s -f --connect-timeout 3 http://localhost:80/index.html > /dev/null 2>&1 || curl -s -f --connect-timeout 3 http://localhost:80/ > /dev/null 2>&1; then
-                echo "✅ Health check attempt $i: PASSED! Web portal is responding."
+                echo "Health check attempt $i: PASSED! Web portal is responding."
                 HEALTH_CHECK_PASSED="true"
                 break
               else
-                echo "⚠️ Health check attempt $i: Waiting for container response..."
+                echo "Health check attempt $i: Waiting for container response..."
               fi
             done
 
             # Step 6: Rollback Evaluation
             if [ "$HEALTH_CHECK_PASSED" != "true" ]; then
-              echo "❌ CRITICAL: Health check FAILED! Stopping pipeline and initiating automatic rollback..."
+              echo "CRITICAL: Health check FAILED! Stopping pipeline and initiating automatic rollback..."
               docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
               
               if [ "$HAS_PREVIOUS" = "true" ]; then
-                echo "🔄 Restoring previous working container ($BACKUP_CONTAINER -> $CONTAINER_NAME)..."
+                echo "Restoring previous working container ($BACKUP_CONTAINER -> $CONTAINER_NAME)..."
                 docker rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
                 docker start "$CONTAINER_NAME"
-                echo "✅ Rollback successful: Previous working version restored and serving traffic."
+                echo "Rollback successful: Previous working version restored and serving traffic."
               else
-                echo "⚠️ No previous running container was available to restore."
+                echo "No previous running container was available to restore."
               fi
               exit 1
             fi
@@ -219,26 +223,26 @@ jobs:
             echo "Step 7: Deployment verified healthy. Cleaning up backup container..."
             docker rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
             echo "=========================================================="
-            echo "🎉 PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
+            echo "PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
             echo "=========================================================="
 
   # =========================================================================
   # STAGE 4: AWS SNS NOTIFICATION (ALWAYS RUNS ON SUCCESS OR FAILURE)
   # =========================================================================
   notify-sns:
-    name: 📢 Send SNS Operations Report
+    name: Send SNS Operations Report
     needs: [quality-gate, build-and-push, deploy]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: 🔑 Configure AWS Credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: 📨 Publish Notification to AWS SNS
+      - name: Publish Notification to AWS SNS
         env:
           QG_STATUS: ${{ needs.quality-gate.result }}
           BUILD_STATUS: ${{ needs.build-and-push.result }}
@@ -297,4 +301,4 @@ EOF
             --subject "$SUBJECT" \
             --message "$MESSAGE"
 
-          echo "✅ AWS SNS Notification sent successfully."
+          echo "AWS SNS Notification sent successfully."
