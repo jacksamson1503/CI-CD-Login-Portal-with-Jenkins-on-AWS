@@ -260,40 +260,18 @@ jobs:
             SUMMARY="The pipeline encountered a failure and was halted. If deployment failed during health checks, the automated rollback mechanism was executed on EC2 to restore the previous working version."
           fi
 
-          # Construct clean plain text message body for SNS email
-          MESSAGE=$(cat <<EOF
-==================================================================
-AWS CI/CD PIPELINE OPERATIONS REPORT
-==================================================================
-
-Overall Status     : $OVERALL_STATUS
-Repository         : ${{ github.repository }}
-Branch             : ${{ github.ref_name }}
-Commit SHA         : ${{ github.sha }}
-Triggered By       : ${{ github.actor }}
-Workflow Run       : $WORKFLOW_RUN_URL
-
-------------------------------------------------------------------
-STAGE-BY-STAGE EXECUTION BREAKDOWN
-------------------------------------------------------------------
-1. Quality Gate & Security Scan : $QG_STATUS
-2. Build & Amazon ECR Push      : $BUILD_STATUS
-3. AWS EC2 Deployment & Rollback: $DEPLOY_STATUS
-
-------------------------------------------------------------------
-OPERATIONAL DETAILS
-------------------------------------------------------------------
-$SUMMARY
-
-Target AWS Region  : ${{ env.AWS_REGION }}
-SNS Topic ARN      : ${{ env.SNS_TOPIC_ARN }}
-Report Timestamp   : $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-
-==================================================================
-This is an automated notification from GitHub Actions CI/CD.
-==================================================================
-EOF
-          )
+          # Construct clean formatted message for SNS email using printf
+          MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nStatus: %s\nRepository: %s\nBranch: %s\nCommit SHA: %s\nTriggered By: %s\nWorkflow URL: %s\n\nSTAGE BREAKDOWN:\n- Quality Gate: %s\n- Build & ECR Push: %s\n- EC2 Deployment: %s\n\nDETAILS:\n%s\n==================================================" \
+            "$OVERALL_STATUS" \
+            "${{ github.repository }}" \
+            "${{ github.ref_name }}" \
+            "${{ github.sha }}" \
+            "${{ github.actor }}" \
+            "$WORKFLOW_RUN_URL" \
+            "$QG_STATUS" \
+            "$BUILD_STATUS" \
+            "$DEPLOY_STATUS" \
+            "$SUMMARY")
 
           echo "Publishing to SNS: ${{ env.SNS_TOPIC_ARN }}"
           aws sns publish \
