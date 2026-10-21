@@ -135,7 +135,7 @@ jobs:
               echo "Pruning older ECR image: $digest"
               aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
             done
-            echo "ECR cleanup complete."
+            echo "ECR cleanup complete: only the 4 newest images are preserved."
           else
             echo "Total images in ECR is within the 4 image limit."
           fi
@@ -181,21 +181,26 @@ jobs:
           script_stop: true
           script: |
             set -e
+            export DEBIAN_FRONTEND=noninteractive
+            export NEEDRESTART_MODE=a
+
             echo "=========================================================="
             echo "STARTING DEPLOYMENT ON DEV-SERVER (STAGING)"
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
 
-            # Auto-install Docker and curl if not present
+            # Auto-install Docker and curl without failing on service restarts
             if ! command -v docker > /dev/null 2>&1; then
-              echo "Docker not found on host. Auto-installing Docker..."
-              sudo apt-get update -y
-              sudo apt-get install -y docker.io curl
-              sudo systemctl enable --now docker
+              echo "Docker not found on host. Installing Docker..."
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker.io curl || true
+              sudo systemctl enable --now docker || true
               sudo usermod -aG docker "$USER" 2>/dev/null || true
             fi
+            sudo systemctl start docker || true
 
+            # Determine Docker execution command
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
             else
@@ -301,21 +306,26 @@ jobs:
           script_stop: true
           script: |
             set -e
+            export DEBIAN_FRONTEND=noninteractive
+            export NEEDRESTART_MODE=a
+
             echo "=========================================================="
             echo "STARTING REAL-TIME PRODUCTION DEPLOYMENT ON PROD-SERVER"
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
 
-            # Auto-install Docker and curl if not present
+            # Auto-install Docker and curl without failing on service restarts
             if ! command -v docker > /dev/null 2>&1; then
-              echo "Docker not found on host. Auto-installing Docker..."
-              sudo apt-get update -y
-              sudo apt-get install -y docker.io curl
-              sudo systemctl enable --now docker
+              echo "Docker not found on host. Installing Docker..."
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker.io curl || true
+              sudo systemctl enable --now docker || true
               sudo usermod -aG docker "$USER" 2>/dev/null || true
             fi
+            sudo systemctl start docker || true
 
+            # Determine Docker execution command
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
             else
@@ -465,4 +475,4 @@ jobs:
               --topic-arn "$TOPIC_ARN" \
               --subject "$SUBJECT" \
               --message "$MESSAGE" || echo "Warning: SNS publish failed. Please check role SNS permissions."
-          
+          fi
