@@ -8,12 +8,14 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # REQUIRED for AWS OIDC authentication
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: login-portal
-  SNS_TOPIC_ARN: 
+  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:181188392988:aws-daily-operations-report
   CONTAINER_NAME: login-portal
+  AWS_ROLE_ARN: arn:aws:iam::181188392988:role/GitHubActions-ECR-Deploy
 
 jobs:
   # =========================================================================
@@ -72,11 +74,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS Credentials
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -122,11 +123,10 @@ jobs:
     needs: [build-and-push]
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Generate ECR Auth Token for EC2
@@ -158,7 +158,6 @@ jobs:
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
 
-            # Auto-detect docker command
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
             else
@@ -251,11 +250,10 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Publish Notification to AWS SNS
@@ -265,7 +263,6 @@ jobs:
           DEPLOY_STATUS: ${{ needs.deploy.result }}
           WORKFLOW_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # Determine overall pipeline outcome
           if [ "$QG_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
             OVERALL_STATUS="SUCCESSFUL"
             SUBJECT="[CI/CD SUCCESS] Production Deployment Succeeded - ${{ github.repository }}"
@@ -273,10 +270,9 @@ jobs:
           else
             OVERALL_STATUS="FAILED"
             SUBJECT="[CI/CD FAILURE / ROLLBACK] Deployment Alert - ${{ github.repository }}"
-            SUMMARY="The pipeline encountered a failure and was halted. If deployment failed during health checks, the automated rollback mechanism was executed on EC2 to restore the previous working version."
+            SUMMARY="The pipeline encountered a failure and was halted."
           fi
 
-          # Construct clean formatted message for SNS email using printf
           MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nStatus: %s\nRepository: %s\nBranch: %s\nCommit SHA: %s\nTriggered By: %s\nWorkflow URL: %s\n\nSTAGE BREAKDOWN:\n- Quality Gate: %s\n- Build & ECR Push: %s\n- EC2 Deployment: %s\n\nDETAILS:\n%s\n==================================================" \
             "$OVERALL_STATUS" \
             "${{ github.repository }}" \
@@ -289,10 +285,13 @@ jobs:
             "$DEPLOY_STATUS" \
             "$SUMMARY")
 
-          echo "Publishing to SNS: ${{ env.SNS_TOPIC_ARN }}"
-          aws sns publish \
-            --topic-arn "${{ env.SNS_TOPIC_ARN }}" \
-            --subject "$SUBJECT" \
-            --message "$MESSAGE"
-
-          echo "AWS SNS Notification sent successfully."
+          if [ -n "${{ env.SNS_TOPIC_ARN }}" ]; then
+            echo "Publishing to SNS: ${{ env.SNS_TOPIC_ARN }}"
+            aws sns publish \
+              --topic-arn "${{ env.SNS_TOPIC_ARN }}" \
+              --subject "$SUBJECT" \
+              --message "$MESSAGE"
+            echo "AWS SNS Notification sent successfully."
+          else
+            echo "SNS_TOPIC_ARN is empty, skipping notification."
+          fi
