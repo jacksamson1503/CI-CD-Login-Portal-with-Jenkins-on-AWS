@@ -34,72 +34,113 @@ jobs:
 
       - name: Validate JavaScript Syntax
         run: |
+          set -e
           echo "Validating JavaScript files..."
-          node --check script.js
-          node --check javascript.js
-          echo "JavaScript syntax check PASSED."
+          for jsfile in script.js javascript.js; do
+            if [ -f "$jsfile" ]; then
+              node --check "$jsfile"
+              echo "Passed syntax check: $jsfile"
+            else
+              echo "CRITICAL: Required JS file $jsfile is missing!"
+              exit 1
+            fi
+          done
 
       - name: Verify Web Assets & HTML Structure
         run: |
-          echo "Checking web assets integrity and structure..."
-          test -s index.html || { echo "index.html missing or empty"; exit 1; }
-          test -s style.css || { echo "style.css missing or empty"; exit 1; }
-          test -s script.js || { echo "script.js missing or empty"; exit 1; }
-          test -s Dockerfile || { echo "Dockerfile missing or empty"; exit 1; }
-          
-          for file in index.html password.html; do
-            grep -i "<html" "$file" || { echo "Missing <html> tag in $file"; exit 1; }
-            grep -i "<head" "$file" || { echo "Missing <head> tag in $file"; exit 1; }
-            grep -i "<body" "$file" || { echo "Missing <body> tag in $file"; exit 1; }
+          set -e
+          echo "Checking web assets existence and basic structure..."
+          REQUIRED_FILES=("index.html" "password.html" "style.css" "script.js" "Dockerfile")
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -s "$file" ]; then
+              echo "CRITICAL ERROR: Asset $file is missing or 0 bytes!"
+              exit 1
+            fi
           done
-          echo "Web assets integrity & HTML structure check PASSED."
 
-      - name: Validate Email and Link Integrity
+          for html in index.html password.html; do
+            echo "Validating tags in $html..."
+            grep -qi "<!doctype html\|<html" "$html" || { echo "Missing <html> or DOCTYPE in $html"; exit 1; }
+            grep -qi "<head" "$html" || { echo "Missing <head> in $html"; exit 1; }
+            grep -qi "<body" "$html" || { echo "Missing <body> in $html"; exit 1; }
+          done
+          echo "Structure check PASSED."
+
+      - name: Comprehensive Link & Email Integrity Check
         run: |
-          echo "Scanning HTML files for malformed email addresses..."
-          INVALID_EMAILS=$(grep -o -E 'mailto:[^"'\'' >]+' index.html password.html 2>/dev/null | grep -v -E '@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' || true)
-          if [ -n "$INVALID_EMAILS" ]; then
-            echo "CRITICAL ERROR: Malformed email detected: $INVALID_EMAILS"
-            echo "Emails must include a valid domain (e.g. name@domain.com)."
+          set -e
+          FAIL=0
+          echo "Scanning HTML files for invalid mailto links and email typos..."
+
+          # 1. Extract all mailto targets across HTML files
+          MAILTOS=$(grep -o -i -E 'mailto:[^"'\'' >]+' index.html password.html 2>/dev/null || true)
+
+          if [ -n "$MAILTOS" ]; then
+            while IFS= read -r mail_entry; do
+              EMAIL="${mail_entry#*:}"
+              EMAIL="${EMAIL%%\?*}"
+
+              if ! echo "$EMAIL" | grep -q -E '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+                echo "CRITICAL ERROR: Malformed email detected in mailto: '$mail_entry'"
+                FAIL=1
+              fi
+            done <<< "$MAILTOS"
+          fi
+
+          # 2. Extract any email pattern in the visible text (catches typos like jacksamsonc@gmailcom)
+          RAW_EMAILS=$(grep -o -E '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+' index.html password.html 2>/dev/null || true)
+          if [ -n "$RAW_EMAILS" ]; then
+            while IFS= read -r raw_email; do
+              if ! echo "$raw_email" | grep -q -E '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+                echo "CRITICAL ERROR: Malformed email detected in text: '$raw_email' (missing dot before domain)"
+                FAIL=1
+              fi
+            done <<< "$RAW_EMAILS"
+          fi
+
+          if [ $FAIL -ne 0 ]; then
+            echo "Email integrity check FAILED: Invalid email addresses detected."
             exit 1
           fi
-          echo "Email and link integrity check PASSED."
+          echo "Email integrity check PASSED."
 
       - name: Scan for Unwanted Text, Placeholders & Dev URLs
         run: |
-          echo "Scanning all codebase files for unwanted text and placeholders..."
-          ERRORS=0
+          set -e
+          FAIL=0
+          TARGET_FILES="index.html password.html script.js style.css"
 
-          # 1. Check for placeholder text (Lorem Ipsum)
-          if grep -r -i -n -E "lorem ipsum" index.html password.html script.js style.css 2>/dev/null; then
-            echo "CRITICAL: Found 'Lorem ipsum' dummy placeholder text!"
-            ERRORS=1
+          echo "Scanning for placeholder & development artifacts..."
+
+          # 1. Lorem Ipsum
+          if grep -i -n -E "lorem[[:space:]]+ipsum" $TARGET_FILES 2>/dev/null; then
+            echo "CRITICAL: Found 'Lorem Ipsum' placeholder text!"
+            FAIL=1
           fi
 
-          # 2. Check for unfinished developer notes (TODO, FIXME, XXX)
-          if grep -r -n -E "\b(TODO|FIXME|XXX|HACK)\b" index.html password.html script.js 2>/dev/null; then
-            echo "CRITICAL: Found unfinished developer tags (TODO / FIXME / XXX)!"
-            ERRORS=1
+          # 2. Developer Action Notes (TODO, FIXME, XXX, HACK)
+          if grep -n -E "(^|[^a-zA-Z0-9_])(TODO|FIXME|XXX|HACK)([^a-zA-Z0-9_]|$)" $TARGET_FILES 2>/dev/null; then
+            echo "CRITICAL: Found unfinished dev markers (TODO / FIXME / XXX / HACK)!"
+            FAIL=1
           fi
 
-          # 3. Check for leftover localhost or local IP addresses in HTML
-          if grep -r -n -i -E "http://(localhost|127\.0\.0\.1)" index.html password.html 2>/dev/null; then
-            echo "CRITICAL: Found local development URL (localhost / 127.0.0.1) in production HTML!"
-            ERRORS=1
+          # 3. Localhost or Local IP patterns
+          if grep -i -n -E "https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)" $TARGET_FILES 2>/dev/null; then
+            echo "CRITICAL: Found dev host URLs (localhost / 127.0.0.1) in production assets!"
+            FAIL=1
           fi
 
-          # 4. Check for dummy or test emails
-          if grep -r -n -i -E "test@example\.com|test@test\.com|user@example\.com" index.html password.html 2>/dev/null; then
-            echo "CRITICAL: Found dummy test email (e.g. test@example.com)!"
-            ERRORS=1
+          # 4. Dummy or Example Emails
+          if grep -i -n -E "\b[a-zA-Z0-9._%+-]+@(example\.com|test\.com|domain\.com)\b" $TARGET_FILES 2>/dev/null; then
+            echo "CRITICAL: Found dummy email domains (@example.com / @test.com)!"
+            FAIL=1
           fi
 
-          if [ $ERRORS -ne 0 ]; then
-            echo "Quality Gate FAILED: Unwanted content or placeholders detected."
+          if [ $FAIL -ne 0 ]; then
+            echo "Quality Gate FAILED: Code contains unwanted text, placeholders, or dev URLs."
             exit 1
           fi
-
-          echo "Quality Gate PASSED: All lines verified clean of unwanted text."
+          echo "Quality Gate PASSED: All files clean."
 
   # =========================================================================
   # TRACK 1B: SECURITY AUDIT & DOCKER SANITY (RUNS IN PARALLEL)
@@ -113,6 +154,7 @@ jobs:
 
       - name: Dockerfile Syntax & Build Sanity Check
         run: |
+          set -e
           echo "Testing Dockerfile build sanity..."
           docker build --no-cache -t quality-gate-test .
           docker rmi quality-gate-test
@@ -120,33 +162,33 @@ jobs:
 
       - name: Security & Secret Leak Audit
         run: |
+          set -e
+          FAIL=0
           echo "Auditing configuration for sensitive credentials..."
-          ERRORS=0
 
-          # 1. Check for private keys
+          # 1. Private keys
           if grep -r -i -E "BEGIN (RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY" . --exclude-dir=".git" 2>/dev/null; then
             echo "CRITICAL: Private key detected in repository!"
-            ERRORS=1
+            FAIL=1
           fi
 
-          # 2. Check for hardcoded AWS Access Key IDs
-          if grep -r -E "AKIA[0-9A-Z]{16}" . --exclude-dir=".git" 2>/dev/null; then
+          # 2. AWS Access Key IDs
+          if grep -r -E "(^|[^A-Z0-9])AKIA[0-9A-Z]{16}([^A-Z0-9]|$)" . --exclude-dir=".git" 2>/dev/null; then
             echo "CRITICAL: Hardcoded AWS Access Key ID detected!"
-            ERRORS=1
+            FAIL=1
           fi
 
-          # 3. Check for GitHub personal access tokens
+          # 3. GitHub personal access tokens
           if grep -r -E "ghp_[0-9a-zA-Z]{36}" . --exclude-dir=".git" 2>/dev/null; then
             echo "CRITICAL: Leaked GitHub token detected!"
-            ERRORS=1
+            FAIL=1
           fi
 
-          if [ $ERRORS -ne 0 ]; then
-            echo "Security Audit FAILED: Leaked secrets detected."
+          if [ $FAIL -ne 0 ]; then
+            echo "Security Audit FAILED: Leaked secrets or credentials found."
             exit 1
           fi
-
-          echo "Security audit PASSED. No leaked keys or credentials found."
+          echo "Security audit PASSED: Clean repository."
 
   # =========================================================================
   # STAGE 2: BUILD, TAG & PUSH DOCKER IMAGE TO AWS ECR
@@ -572,18 +614,18 @@ jobs:
 
           | Metric | Status |
           | :--- | :--- |
-          | **Deployment Strategy** |  Zero-Downtime Blue/Green Swap |
+          | **Deployment Strategy** | Zero-Downtime Blue/Green Swap |
           | **Active Live Slot** | **Slot ${{ env.ACTIVE_SLOT }}** |
           | **Retired Slot** | Slot ${{ env.PREV_SLOT }} |
-          | **Target Server** | ${{ secrets.PRODUCTION_EC2_HOST }} |
+          | **Target Server** | 🖥️ ${{ secrets.PRODUCTION_EC2_HOST }} |
           | **Downtime** | **0 ms** (Seamless Nginx Reload) |
           | **Rollback Safeguard** | Active & Protected |
           | **Image Retention** | Enforced (Latest 4 Images) |
 
           ### Pipeline Stage Results
-          - **Code Quality Gate**: Passed
-          - **Security & Secret Audit**: Passed
-          - **Docker Build & Push**: Stored in ECR
-          - **Ephemeral Runner Test**: Healthy on port 8080
-          - **Blue/Green Swap**: Successfully Switched Upstream
+          - ✅ **Code Quality Gate**: Passed
+          - ✅ **Security & Secret Audit**: Passed
+          - ✅ **Docker Build & Push**: Stored in ECR
+          - ✅ **Ephemeral Runner Test**: Healthy on port 8080
+          - ✅ **Blue/Green Swap**: Successfully Switched Upstream
           EOF
