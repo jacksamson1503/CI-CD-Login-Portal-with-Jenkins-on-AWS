@@ -68,41 +68,52 @@ jobs:
 
       - name: Comprehensive Link & Email Integrity Check
         run: |
-          set -e
-          FAIL=0
-          echo "Scanning HTML files for invalid mailto links and email typos..."
+          node -e '
+            const fs = require("fs");
+            let hasError = false;
+            const validEmailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+            const files = ["index.html", "password.html"];
 
-          # 1. Extract all mailto targets across HTML files
-          MAILTOS=$(grep -o -i -E 'mailto:[^"'\'' >]+' index.html password.html 2>/dev/null || true)
+            console.log("Scanning HTML files for mailto links and email typos...");
 
-          if [ -n "$MAILTOS" ]; then
-            while IFS= read -r mail_entry; do
-              EMAIL="${mail_entry#*:}"
-              EMAIL="${EMAIL%%\?*}"
+            for (const file of files) {
+              if (!fs.existsSync(file)) continue;
+              const content = fs.readFileSync(file, "utf8");
 
-              if ! echo "$EMAIL" | grep -q -E '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
-                echo "CRITICAL ERROR: Malformed email detected in mailto: '$mail_entry'"
-                FAIL=1
-              fi
-            done <<< "$MAILTOS"
-          fi
+              // 1. Verify mailto links
+              const mailtoMatches = [...content.matchAll(/mailto:([^"'\s>]+)/gi)];
+              for (const match of mailtoMatches) {
+                const email = match[1].split("?")[0].trim();
+                if (!validEmailRegex.test(email)) {
+                  console.error(`CRITICAL ERROR: Malformed email detected in mailto in ${file}: "${email}"`);
+                  hasError = true;
+                } else {
+                  console.log(`Verified valid mailto in ${file}: ${email}`);
+                }
+              }
 
-          # 2. Extract any email pattern in the visible text (catches typos like jacksamsonc@gmailcom)
-          RAW_EMAILS=$(grep -o -E '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+' index.html password.html 2>/dev/null || true)
-          if [ -n "$RAW_EMAILS" ]; then
-            while IFS= read -r raw_email; do
-              if ! echo "$raw_email" | grep -q -E '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
-                echo "CRITICAL ERROR: Malformed email detected in text: '$raw_email' (missing dot before domain)"
-                FAIL=1
-              fi
-            done <<< "$RAW_EMAILS"
-          fi
+              // 2. Verify candidate emails in text (ignoring font/stylesheet URLs)
+              const lines = content.split(/\r?\n/);
+              lines.forEach((line, index) => {
+                if (/fonts\.googleapis\.com|wght@/i.test(line)) return;
+                const matches = line.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\b/g) || [];
+                for (const candidate of matches) {
+                  if (!validEmailRegex.test(candidate)) {
+                    console.error(`CRITICAL ERROR: Malformed email in ${file}:${index + 1} -> "${candidate}" (missing dot before domain)`);
+                    hasError = true;
+                  } else {
+                    console.log(`Verified valid email in ${file}:${index + 1} -> ${candidate}`);
+                  }
+                }
+              });
+            }
 
-          if [ $FAIL -ne 0 ]; then
-            echo "Email integrity check FAILED: Invalid email addresses detected."
-            exit 1
-          fi
-          echo "Email integrity check PASSED."
+            if (hasError) {
+              console.error("Email integrity check FAILED: Invalid email addresses detected.");
+              process.exit(1);
+            }
+            console.log("Email integrity check PASSED.");
+          '
 
       - name: Scan for Unwanted Text, Placeholders & Dev URLs
         run: |
