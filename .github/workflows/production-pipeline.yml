@@ -68,52 +68,7 @@ jobs:
 
       - name: Comprehensive Link & Email Integrity Check
         run: |
-          node -e '
-            const fs = require("fs");
-            let hasError = false;
-            const validEmailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-            const files = ["index.html", "password.html"];
-
-            console.log("Scanning HTML files for mailto links and email typos...");
-
-            for (const file of files) {
-              if (!fs.existsSync(file)) continue;
-              const content = fs.readFileSync(file, "utf8");
-
-              // 1. Verify mailto links
-              const mailtoMatches = [...content.matchAll(/mailto:([^"'\s>]+)/gi)];
-              for (const match of mailtoMatches) {
-                const email = match[1].split("?")[0].trim();
-                if (!validEmailRegex.test(email)) {
-                  console.error(`CRITICAL ERROR: Malformed email detected in mailto in ${file}: "${email}"`);
-                  hasError = true;
-                } else {
-                  console.log(`Verified valid mailto in ${file}: ${email}`);
-                }
-              }
-
-              // 2. Verify candidate emails in text (ignoring font/stylesheet URLs)
-              const lines = content.split(/\r?\n/);
-              lines.forEach((line, index) => {
-                if (/fonts\.googleapis\.com|wght@/i.test(line)) return;
-                const matches = line.match(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\b/g) || [];
-                for (const candidate of matches) {
-                  if (!validEmailRegex.test(candidate)) {
-                    console.error(`CRITICAL ERROR: Malformed email in ${file}:${index + 1} -> "${candidate}" (missing dot before domain)`);
-                    hasError = true;
-                  } else {
-                    console.log(`Verified valid email in ${file}:${index + 1} -> ${candidate}`);
-                  }
-                }
-              });
-            }
-
-            if (hasError) {
-              console.error("Email integrity check FAILED: Invalid email addresses detected.");
-              process.exit(1);
-            }
-            console.log("Email integrity check PASSED.");
-          '
+          node validate.js
 
       - name: Scan for Unwanted Text, Placeholders & Dev URLs
         run: |
