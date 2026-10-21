@@ -1,0 +1,265 @@
+name: Full CI-CD Flow
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'login-portal' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  lint-and-syntax:
+    name: Stage 1 - Lint and Syntax Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check JavaScript syntax
+        run: |
+          node --check script.js
+      - name: Validate required web assets
+        run: |
+          test -s index.html
+          test -s style.css
+          test -s script.js
+          grep -qi '<html' index.html
+          grep -qi '<form' index.html
+      - name: Shell script syntax check
+        run: bash -n tests/smoke-test.sh
+
+  build-and-test:
+    name: Stage 2 and 3 - Build and Automated Tests
+    needs: lint-and-syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build --pull -t login-portal:${{ github.sha }} .
+      - name: Start container for smoke test
+        run: |
+          docker run -d --rm --name login-portal-test -p 127.0.0.1:8080:80 login-portal:${{ github.sha }}
+          for attempt in {1..10}; do
+            if curl --fail --silent http://127.0.0.1:8080/ >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8080/ | grep -qi 'Jack Samson'
+          curl --fail --silent http://127.0.0.1:8080/style.css >/dev/null
+          curl --fail --silent http://127.0.0.1:8080/script.js >/dev/null
+      - name: Stop test container
+        if: always()
+        run: docker rm -f login-portal-test 2>/dev/null || true
+
+  security-scan:
+    name: Stage 4 - Container Security Scan
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image for scanning
+        run: docker build --pull -t login-portal:scan .
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: login-portal:scan
+          format: table
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
+
+  build-and-push:
+    name: Build and Push Versioned Image to ECR
+    if: github.event_name != 'pull_request'
+    needs: security-scan
+    runs-on: ubuntu-latest
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure AWS credentials (GitHub OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push immutable image
+        id: image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --pull -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  staging-deploy:
+    name: Stage 5 - Deploy to Staging
+    if: github.event_name != 'pull_request'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Deploy image to staging EC2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        with:
+          host: ${{ secrets.STAGING_EC2_HOST }}
+          username: ${{ secrets.STAGING_EC2_USER }}
+          key: ${{ secrets.STAGING_EC2_SSH_KEY }}
+          envs: IMAGE,AWS_REGION
+          script_stop: true
+          script: |
+            set -eu
+            command -v docker >/dev/null
+            command -v aws >/dev/null
+            REGISTRY="${IMAGE%%/*}"
+            aws ecr get-login-password --region "$AWS_REGION" | sudo docker login --username AWS --password-stdin "$REGISTRY"
+            sudo docker pull "$IMAGE"
+            sudo docker rm -f login-portal-staging-previous 2>/dev/null || true
+            if sudo docker ps -q --filter name=^/login-portal-staging$ | grep -q .; then
+              sudo docker stop login-portal-staging
+              sudo docker rename login-portal-staging login-portal-staging-previous
+            fi
+            if ! sudo docker run -d --name login-portal-staging -p 80:80 --restart unless-stopped "$IMAGE"; then
+              sudo docker rm -f login-portal-staging 2>/dev/null || true
+              if sudo docker container inspect login-portal-staging-previous >/dev/null 2>&1; then
+                sudo docker rename login-portal-staging-previous login-portal-staging
+                sudo docker start login-portal-staging
+              fi
+              exit 1
+            fi
+            for attempt in 1 2 3 4 5; do
+              sleep 3
+              if curl --fail --silent http://localhost/ >/dev/null; then
+                sudo docker rm -f login-portal-staging-previous 2>/dev/null || true
+                exit 0
+              fi
+            done
+            sudo docker rm -f login-portal-staging 2>/dev/null || true
+            if sudo docker container inspect login-portal-staging-previous >/dev/null 2>&1; then
+              sudo docker rename login-portal-staging-previous login-portal-staging
+              sudo docker start login-portal-staging
+            fi
+            exit 1
+
+  staging-e2e:
+    name: Stage 6 - Staging End-to-End Smoke Test
+    if: github.event_name != 'pull_request'
+    needs: staging-deploy
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Check staging website
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+        run: |
+          test -n "$STAGING_URL" || { echo "Set STAGING_URL in the staging environment variables"; exit 1; }
+          curl --fail --show-error --retry 5 --retry-delay 5 "$STAGING_URL/" | grep -qi 'Jack Samson'
+          curl --fail --show-error "$STAGING_URL/style.css" >/dev/null
+          curl --fail --show-error "$STAGING_URL/script.js" >/dev/null
+
+  production-deploy:
+    name: Stage 7 and 8 - Approved Production Deployment
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [build-and-push, staging-e2e]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy image to production EC2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        with:
+          host: ${{ secrets.PRODUCTION_EC2_HOST }}
+          username: ${{ secrets.PRODUCTION_EC2_USER }}
+          key: ${{ secrets.PRODUCTION_EC2_SSH_KEY }}
+          envs: IMAGE,AWS_REGION
+          script_stop: true
+          script: |
+            set -eu
+            command -v docker >/dev/null
+            command -v aws >/dev/null
+            REGISTRY="${IMAGE%%/*}"
+            aws ecr get-login-password --region "$AWS_REGION" | sudo docker login --username AWS --password-stdin "$REGISTRY"
+            sudo docker pull "$IMAGE"
+            sudo docker rm -f login-portal-production-previous 2>/dev/null || true
+            if sudo docker ps -q --filter name=^/login-portal-production$ | grep -q .; then
+              sudo docker stop login-portal-production
+              sudo docker rename login-portal-production login-portal-production-previous
+            fi
+            if ! sudo docker run -d --name login-portal-production -p 80:80 --restart unless-stopped "$IMAGE"; then
+              sudo docker rm -f login-portal-production 2>/dev/null || true
+              if sudo docker container inspect login-portal-production-previous >/dev/null 2>&1; then
+                sudo docker rename login-portal-production-previous login-portal-production
+                sudo docker start login-portal-production
+              fi
+              exit 1
+            fi
+            HEALTHY=false
+            for attempt in 1 2 3 4 5; do
+              sleep 3
+              if curl --fail --silent http://localhost/ >/dev/null; then
+                HEALTHY=true
+                break
+              fi
+            done
+            if [ "$HEALTHY" != true ]; then
+              sudo docker rm -f login-portal-production 2>/dev/null || true
+              if sudo docker container inspect login-portal-production-previous >/dev/null 2>&1; then
+                sudo docker rename login-portal-production-previous login-portal-production
+                sudo docker start login-portal-production
+              fi
+              exit 1
+            fi
+            sudo docker rm -f login-portal-production-previous 2>/dev/null || true
+
+  notify:
+    name: Stage 9 - SNS Pipeline Notification
+    if: always() && github.event_name != 'pull_request'
+    needs: [lint-and-syntax, build-and-test, security-scan, build-and-push, staging-deploy, staging-e2e, production-deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (GitHub OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Send pipeline result to SNS
+        env:
+          TOPIC_ARN: ${{ secrets.SNS_TOPIC_ARN }}
+          LINT: ${{ needs.lint-and-syntax.result }}
+          TEST: ${{ needs.build-and-test.result }}
+          SCAN: ${{ needs.security-scan.result }}
+          BUILD: ${{ needs.build-and-push.result }}
+          STAGING: ${{ needs.staging-deploy.result }}
+          E2E: ${{ needs.staging-e2e.result }}
+          PROD: ${{ needs.production-deploy.result }}
+        run: |
+          if [ -z "$TOPIC_ARN" ]; then
+            echo "SNS_TOPIC_ARN is not configured; skipping notification."
+            exit 0
+          fi
+          STATUS=SUCCESS
+          for result in "$LINT" "$TEST" "$SCAN" "$BUILD" "$STAGING" "$E2E" "$PROD"; do
+            if [ "$result" = failure ]; then STATUS=FAILED; fi
+          done
+          MESSAGE=$(printf 'CI/CD result: %s\nRepository: %s\nCommit: %s\nLint: %s\nTests: %s\nSecurity: %s\nBuild/ECR: %s\nStaging: %s\nStaging E2E: %s\nProduction: %s\nRun: %s' "$STATUS" "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$LINT" "$TEST" "$SCAN" "$BUILD" "$STAGING" "$E2E" "$PROD" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          aws sns publish --topic-arn "$TOPIC_ARN" --subject "[CI/CD $STATUS] $GITHUB_REPOSITORY" --message "$MESSAGE"
