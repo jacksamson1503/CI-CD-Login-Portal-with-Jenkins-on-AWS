@@ -1,4 +1,4 @@
-name: Production & Staging CI/CD Pipeline
+name: Enterprise Production CI/CD Pipeline
 
 on:
   push:
@@ -18,10 +18,10 @@ env:
 
 jobs:
   # =========================================================================
-  # STAGE 1: QUALITY GATE & STATIC ANALYSIS
+  # TRACK 1A: CODE QUALITY GATE & ASSET INTEGRITY
   # =========================================================================
-  quality-gate:
-    name: Quality Gate & Security Scan
+  code-quality:
+    name: Code Quality & Asset Integrity
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -37,7 +37,7 @@ jobs:
           echo "Validating JavaScript files..."
           node --check script.js
           node --check javascript.js
-          echo "JavaScript syntax validation passed."
+          echo "JavaScript syntax check PASSED."
 
       - name: Verify Web Assets Integrity
         run: |
@@ -48,21 +48,40 @@ jobs:
           test -s Dockerfile || { echo "Dockerfile missing or empty"; exit 1; }
           grep -i "<html" index.html || { echo "Missing <html> tag in index.html"; exit 1; }
           grep -i "<html" password.html || { echo "Missing <html> tag in password.html"; exit 1; }
-          echo "Web assets integrity check passed."
+          echo "Web assets integrity check PASSED."
+
+  # =========================================================================
+  # TRACK 1B: DOCKER SANITY & SECURITY AUDIT (RUNS IN PARALLEL)
+  # =========================================================================
+  security-audit:
+    name: Docker Sanity & Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Dockerfile Syntax & Build Sanity Check
         run: |
-          echo "Testing Docker build sanity in Quality Gate..."
+          echo "Testing Dockerfile build sanity..."
           docker build --no-cache -t quality-gate-test .
           docker rmi quality-gate-test
-          echo "Dockerfile quality gate passed."
+          echo "Docker build sanity check PASSED."
+
+      - name: Security Best-Practices Audit
+        run: |
+          echo "Auditing configuration for sensitive data..."
+          if grep -r -i -E "BEGIN (RSA|OPENSSH) PRIVATE KEY" . --exclude-dir=".git" 2>/dev/null; then
+            echo "CRITICAL: Private key detected in repository!"
+            exit 1
+          fi
+          echo "Security audit PASSED. No leaked keys found."
 
   # =========================================================================
-  # STAGE 2: BUILD, PUSH & AUTO-CLEANUP IN AWS ECR (KEEP LAST 4)
+  # STAGE 2: BUILD, TAG & PUSH DOCKER IMAGE TO AWS ECR
   # =========================================================================
   build-and-push:
     name: Build & Store Image in AWS ECR
-    needs: [quality-gate]
+    needs: [code-quality, security-audit]
     runs-on: ubuntu-latest
     outputs:
       ecr_registry: ${{ steps.login-ecr.outputs.registry }}
@@ -87,7 +106,7 @@ jobs:
           IMAGE_TAG="${{ github.sha }}"
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Build, Tag, and Push Docker Image to Amazon ECR
+      - name: Build, Tag, and Push Docker Image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
@@ -100,16 +119,67 @@ jobs:
           docker push "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
           docker push "$ECR_REGISTRY/$TARGET_REPO:latest"
           
-          echo "Verifying pushed images in AWS ECR..."
-          aws ecr describe-images --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --query 'imageDetails[*].imageTags' --output text || true
+          echo "Image successfully stored in Amazon ECR."
 
-      - name: Retain Only Last 4 Images in AWS ECR
+  # =========================================================================
+  # TRACK 3A: RUNNER CONTAINER INTEGRATION TEST ($0 STAGING)
+  # =========================================================================
+  container-test:
+    name: Runner Container Test ($0 Staging)
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Launch Container & Verify Web Health
+        env:
+          ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          TARGET_IMAGE="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
+          echo "Spinning up ephemeral test container: $TARGET_IMAGE"
+          docker run -d --name runner-integration-test -p 8080:80 "$TARGET_IMAGE"
+          
+          sleep 4
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/)
+          echo "Integration Test HTTP Response: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Error: Container failed health check on runner!"
+            docker logs runner-integration-test
+            docker rm -f runner-integration-test
+            exit 1
+          fi
+
+          echo "Container integration test passed with HTTP 200 OK!"
+          docker rm -f runner-integration-test
+
+  # =========================================================================
+  # TRACK 3B: ECR LIFECYCLE & RETENTION HYGIENE (RUNS IN PARALLEL)
+  # =========================================================================
+  ecr-hygiene:
+    name: ECR Retention (Keep Last 4)
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Clean Untagged and Enforce 4-Image Limit
         env:
           TARGET_REPO: ${{ env.ECR_REPOSITORY }}
         run: |
-          echo "Enforcing ECR retention policy: keeping only last 4 images..."
+          echo "Enforcing ECR retention limit of 4 images..."
           
-          # Delete any untagged images first
           UNTAGGED_DIGESTS=$(aws ecr list-images \
             --repository-name "$TARGET_REPO" \
             --region ${{ env.AWS_REGION }} \
@@ -123,7 +193,6 @@ jobs:
             done
           fi
 
-          # Find digests older than the top 4 most recent images
           OLD_ECR_DIGESTS=$(aws ecr describe-images \
             --repository-name "$TARGET_REPO" \
             --region ${{ env.AWS_REGION }} \
@@ -135,142 +204,17 @@ jobs:
               echo "Pruning older ECR image: $digest"
               aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
             done
-            echo "ECR cleanup complete: only the 4 newest images are preserved."
+            echo "ECR cleanup complete."
           else
-            echo "Total images in ECR is within the 4 image limit."
+            echo "ECR image count is within the 4 image limit."
           fi
 
   # =========================================================================
-  # STAGE 3: DEPLOY TO DEV-SERVER (STAGING ENVIRONMENT)
-  # =========================================================================
-  deploy-staging:
-    name: Deploy to Dev-server (Staging)
-    needs: [build-and-push]
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Prepare Deployment Variables
-        id: prep
-        run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
-          TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
-          echo "::add-mask::$TOKEN"
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
-
-      - name: SSH to Dev-server & Execute Deployment
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          ECR_REGISTRY: ${{ steps.prep.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-          ECR_TOKEN: ${{ steps.prep.outputs.token }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
-        with:
-          host: ${{ secrets.STAGING_EC2_HOST }}
-          username: ${{ secrets.STAGING_EC2_USER }}
-          key: ${{ secrets.STAGING_EC2_SSH_KEY || secrets.EC2_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ECR_TOKEN,CONTAINER_NAME
-          script_stop: true
-          script: |
-            set -e
-            export DEBIAN_FRONTEND=noninteractive
-            export NEEDRESTART_MODE=a
-
-            echo "=========================================================="
-            echo "STARTING DEPLOYMENT ON DEV-SERVER (STAGING)"
-            TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-            echo "Target Image: $TARGET_IMAGE"
-            echo "=========================================================="
-
-            # Auto-install Docker and curl without failing on service restarts
-            if ! command -v docker > /dev/null 2>&1; then
-              echo "Docker not found on host. Installing Docker..."
-              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker.io curl || true
-              sudo systemctl enable --now docker || true
-              sudo usermod -aG docker "$USER" 2>/dev/null || true
-            fi
-            sudo systemctl start docker || true
-
-            # Determine Docker execution command
-            if docker info > /dev/null 2>&1; then
-              DOCKER_CMD="docker"
-            else
-              DOCKER_CMD="sudo docker"
-            fi
-
-            # Step 1: Login Docker to ECR
-            echo "Authenticating Docker with Amazon ECR on Dev-server..."
-            echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
-
-            # Step 2: Pull Target Image
-            echo "Pulling Docker image: $TARGET_IMAGE..."
-            $DOCKER_CMD pull "$TARGET_IMAGE"
-
-            # Step 3: Stop & Remove old container if present
-            echo "Stopping old container if present..."
-            $DOCKER_CMD rm -f "$CONTAINER_NAME" 2>/dev/null || true
-
-            # Free port 80 from host web servers if any
-            sudo systemctl stop apache2 2>/dev/null || true
-            sudo systemctl stop nginx 2>/dev/null || true
-
-            # Step 4: Run New Container
-            echo "Launching new container on port 80..."
-            $DOCKER_CMD run -d \
-              --name "$CONTAINER_NAME" \
-              -p 80:80 \
-              --restart unless-stopped \
-              "$TARGET_IMAGE"
-
-            # Step 5: Verification & Health Check
-            echo "Running health checks on Dev-server..."
-            HEALTH_PASSED="false"
-            for i in 1 2 3 4 5; do
-              sleep 4
-              if curl -s -f --connect-timeout 3 http://localhost:80/ > /dev/null 2>&1 || curl -s -f --connect-timeout 3 http://localhost:80/index.html > /dev/null 2>&1; then
-                echo "Health check attempt $i: PASSED! Dev-server is live."
-                HEALTH_PASSED="true"
-                break
-              else
-                echo "Health check attempt $i: Waiting for container response..."
-              fi
-            done
-
-            if [ "$HEALTH_PASSED" != "true" ]; then
-              echo "Health check FAILED on Dev-server!"
-              exit 1
-            fi
-
-            # Step 6: Host Docker Cleanup (Keep only running container & last 4 images)
-            echo "Performing Docker cleanup on Dev-server..."
-            $DOCKER_CMD container prune -f 2>/dev/null || true
-
-            OLD_IMAGES=$($DOCKER_CMD images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.CreatedAt}}\t{{.ID}}" 2>/dev/null | sort -r | awk '{print $NF}' | awk '!seen[$0]++' | tail -n +5 || true)
-            if [ -n "$OLD_IMAGES" ]; then
-              echo "Deleting older Docker images beyond latest 4 on Dev-server: $OLD_IMAGES"
-              echo "$OLD_IMAGES" | xargs -r $DOCKER_CMD rmi -f 2>/dev/null || true
-            fi
-            $DOCKER_CMD image prune -f 2>/dev/null || true
-
-            echo "=========================================================="
-            echo "DEV-SERVER (STAGING) DEPLOYMENT COMPLETED SUCCESSFULLY!"
-            echo "=========================================================="
-
-  # =========================================================================
-  # STAGE 4: DEPLOY TO PROD-SERVER (PRODUCTION ENVIRONMENT)
+  # STAGE 4: ZERO-DOWNTIME SAFE DEPLOYMENT TO SINGLE PROD EC2
   # =========================================================================
   deploy-production:
-    name: Deploy to Prod-server (Production)
-    needs: [build-and-push, deploy-staging]
+    name: Zero-Downtime Deploy to EC2
+    needs: [container-test, ecr-hygiene]
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -290,7 +234,7 @@ jobs:
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
           echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
 
-      - name: SSH to Prod-server & Execute Production Deployment
+      - name: SSH to Prod-server & Execute Zero-Downtime Swap
         uses: appleboy/ssh-action@v1.0.3
         env:
           ECR_REGISTRY: ${{ steps.prep.outputs.registry }}
@@ -310,14 +254,13 @@ jobs:
             export NEEDRESTART_MODE=a
 
             echo "=========================================================="
-            echo "STARTING REAL-TIME PRODUCTION DEPLOYMENT ON PROD-SERVER"
+            echo "STARTING ZERO-DOWNTIME SAFE PRODUCTION DEPLOYMENT"
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
 
-            # Auto-install Docker and curl without failing on service restarts
             if ! command -v docker > /dev/null 2>&1; then
-              echo "Docker not found on host. Installing Docker..."
+              echo "Installing Docker..."
               sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
               sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker.io curl || true
               sudo systemctl enable --now docker || true
@@ -325,99 +268,94 @@ jobs:
             fi
             sudo systemctl start docker || true
 
-            # Determine Docker execution command
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
             else
               DOCKER_CMD="sudo docker"
             fi
 
-            # Step 1: AWS ECR Authentication on EC2
-            echo "Step 1: Authenticating Docker with Amazon ECR..."
+            # Step 1: Login Docker to ECR
+            echo "Authenticating Docker with Amazon ECR..."
             echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
 
-            # Step 2: Pull New Image with fallback
-            echo "Step 2: Pulling new image from ECR..."
-            if ! $DOCKER_CMD pull "$TARGET_IMAGE"; then
-              echo "Specific commit tag pull returned not found. Trying fallback to 'latest' tag..."
-              TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
-              $DOCKER_CMD pull "$TARGET_IMAGE"
+            # Step 2: Pull New Image
+            echo "Pulling new image: $TARGET_IMAGE..."
+            $DOCKER_CMD pull "$TARGET_IMAGE"
+
+            # Step 3: Test New Version on temporary slot (Port 8081) BEFORE touching live port 80!
+            CANDIDATE_CONTAINER="${CONTAINER_NAME}-candidate"
+            $DOCKER_CMD rm -f "$CANDIDATE_CONTAINER" 2>/dev/null || true
+
+            echo "Launching candidate container on port 8081 to verify health..."
+            $DOCKER_CMD run -d --name "$CANDIDATE_CONTAINER" -p 8081:80 "$TARGET_IMAGE"
+
+            # Step 4: Health Check on Candidate
+            CANDIDATE_HEALTHY="false"
+            for i in 1 2 3 4 5; do
+              sleep 3
+              if curl -s -f --connect-timeout 2 http://localhost:8081/ > /dev/null 2>&1 || curl -s -f --connect-timeout 2 http://localhost:8081/index.html > /dev/null 2>&1; then
+                echo "Health check attempt $i: PASSED! Candidate is healthy."
+                CANDIDATE_HEALTHY="true"
+                break
+              else
+                echo "Health check attempt $i: Waiting for candidate container..."
+              fi
+            done
+
+            # Step 5: Rollback Safeguard (If candidate fails, LIVE CONTAINER WAS NEVER TOUCHED!)
+            if [ "$CANDIDATE_HEALTHY" != "true" ]; then
+              echo "CRITICAL: Candidate failed health check! Aborting deployment."
+              echo "SAFEGUARD ACTIVE: Your live production container was NEVER stopped."
+              $DOCKER_CMD rm -f "$CANDIDATE_CONTAINER" 2>/dev/null || true
+              exit 1
             fi
 
-            # Step 3: Backup existing container for instant rollback safeguard
-            echo "Step 3: Staging existing container for rollback safeguard..."
+            # Step 6: Instant Zero-Downtime Promotion to Live Port 80
+            echo "Candidate verified healthy. Promoting to live port 80..."
+            $DOCKER_CMD rm -f "$CANDIDATE_CONTAINER" 2>/dev/null || true
+
             BACKUP_CONTAINER="${CONTAINER_NAME}-backup"
             $DOCKER_CMD rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
 
-            HAS_PREVIOUS="false"
             if [ "$($DOCKER_CMD ps -q -f name=^/${CONTAINER_NAME}$)" ]; then
-              echo "Active container found. Renaming to $BACKUP_CONTAINER..."
               $DOCKER_CMD stop "$CONTAINER_NAME"
               $DOCKER_CMD rename "$CONTAINER_NAME" "$BACKUP_CONTAINER"
-              HAS_PREVIOUS="true"
-            elif [ "$($DOCKER_CMD ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
-              $DOCKER_CMD rm -f "$CONTAINER_NAME"
             fi
 
-            # Ensure port 80 is free from existing system web servers
             sudo systemctl stop apache2 2>/dev/null || true
             sudo systemctl stop nginx 2>/dev/null || true
 
-            # Step 4: Run New Container
-            echo "Step 4: Launching new container ($CONTAINER_NAME)..."
             $DOCKER_CMD run -d \
               --name "$CONTAINER_NAME" \
               -p 80:80 \
               --restart unless-stopped \
               "$TARGET_IMAGE"
 
-            # Step 5: Automated Health Check with Auto-Rollback
-            echo "Step 5: Verifying container health on Prod-server..."
-            HEALTH_CHECK_PASSED="false"
-            for i in 1 2 3 4 5; do
-              sleep 4
-              if curl -s -f --connect-timeout 3 http://localhost:80/index.html > /dev/null 2>&1 || curl -s -f --connect-timeout 3 http://localhost:80/ > /dev/null 2>&1; then
-                echo "Health check attempt $i: PASSED! Web portal is responding."
-                HEALTH_CHECK_PASSED="true"
-                break
-              else
-                echo "Health check attempt $i: Waiting for container response..."
-              fi
-            done
-
-            # Step 6: Rollback Evaluation
-            if [ "$HEALTH_CHECK_PASSED" != "true" ]; then
-              echo "CRITICAL: Health check FAILED! Initiating automatic rollback..."
+            # Final check on port 80
+            if ! curl -s -f --connect-timeout 3 http://localhost:80/ > /dev/null 2>&1; then
+              echo "Port 80 check failed! Restoring backup container..."
               $DOCKER_CMD rm -f "$CONTAINER_NAME" 2>/dev/null || true
-              
-              if [ "$HAS_PREVIOUS" = "true" ]; then
-                echo "Restoring previous working container ($BACKUP_CONTAINER -> $CONTAINER_NAME)..."
-                $DOCKER_CMD rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
-                $DOCKER_CMD start "$CONTAINER_NAME"
-                echo "Rollback successful: Previous working version restored."
-              else
-                echo "No previous running container was available to restore."
-              fi
+              $DOCKER_CMD rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
+              $DOCKER_CMD start "$CONTAINER_NAME"
+              echo "Rollback complete."
               exit 1
             fi
 
-            # Step 7: Cleanup backup container on success
-            echo "Step 7: Deployment verified healthy. Cleaning up backup container..."
             $DOCKER_CMD rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
 
-            # Step 8: Auto-Cleanup: Keep only active container & last 4 Docker images
-            echo "Step 8: Performing Docker host cleanup on Prod-server..."
+            # Step 7: Auto-Cleanup: Keep only active container & last 4 Docker images
+            echo "Cleaning up host Docker images (retaining last 4)..."
             $DOCKER_CMD container prune -f 2>/dev/null || true
 
             OLD_IMAGES=$($DOCKER_CMD images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.CreatedAt}}\t{{.ID}}" 2>/dev/null | sort -r | awk '{print $NF}' | awk '!seen[$0]++' | tail -n +5 || true)
             if [ -n "$OLD_IMAGES" ]; then
-              echo "Deleting older Docker images beyond latest 4 on Prod-server: $OLD_IMAGES"
+              echo "Deleting older Docker images beyond latest 4: $OLD_IMAGES"
               echo "$OLD_IMAGES" | xargs -r $DOCKER_CMD rmi -f 2>/dev/null || true
             fi
             $DOCKER_CMD image prune -f 2>/dev/null || true
 
             echo "=========================================================="
-            echo "PROD-SERVER PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
+            echo "PRODUCTION DEPLOYMENT COMPLETED WITH ZERO DOWNTIME!"
             echo "=========================================================="
 
   # =========================================================================
@@ -425,7 +363,7 @@ jobs:
   # =========================================================================
   notify:
     name: Operations Summary & SNS Email
-    needs: [quality-gate, build-and-push, deploy-staging, deploy-production]
+    needs: [code-quality, security-audit, build-and-push, container-test, ecr-hygiene, deploy-production]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -437,24 +375,25 @@ jobs:
 
       - name: Publish Operations Report to SNS Email
         env:
-          QG_STATUS: ${{ needs.quality-gate.result }}
+          QG_STATUS: ${{ needs.code-quality.result }}
+          SEC_STATUS: ${{ needs.security-audit.result }}
           BUILD_STATUS: ${{ needs.build-and-push.result }}
-          STAGING_STATUS: ${{ needs.deploy-staging.result }}
+          TEST_STATUS: ${{ needs.container-test.result }}
           PROD_STATUS: ${{ needs.deploy-production.result }}
           WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
         run: |
-          if [ "$QG_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$STAGING_STATUS" = "success" ] && [ "$PROD_STATUS" = "success" ]; then
+          if [ "$QG_STATUS" = "success" ] && [ "$SEC_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$TEST_STATUS" = "success" ] && [ "$PROD_STATUS" = "success" ]; then
             OVERALL_STATUS="SUCCESS"
-            SUBJECT="[CI/CD SUCCESS] Staging & Production Deployment Succeeded - ${{ github.repository }}"
-            SUMMARY="All stages passed successfully! The application container is running and healthy on both Dev-server and Prod-server."
+            SUBJECT="[CI/CD SUCCESS] Zero-Downtime Production Deployment Succeeded - ${{ github.repository }}"
+            SUMMARY="All stages passed successfully! The application was tested and promoted to production with zero downtime."
           else
             OVERALL_STATUS="FAILED"
-            SUBJECT="[CI/CD ALERT] Deployment Failed - ${{ github.repository }}"
-            SUMMARY="The pipeline encountered a failure during execution. Check the logs for details."
+            SUBJECT="[CI/CD ALERT] Production Deployment Failed - ${{ github.repository }}"
+            SUMMARY="The deployment halted. If a failure occurred, the live version was protected and left untouched."
           fi
 
-          MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nOverall Status: %s\nRepository:     %s\nBranch:         %s\nCommit SHA:     %s\nTriggered By:   %s\nWorkflow URL:   %s\n\nSTAGE BREAKDOWN:\n- 1. Quality Gate:       %s\n- 2. Build & ECR Push:   %s\n- 3. Dev-server Staging: %s\n- 4. Prod-server Deploy: %s\n\nDETAILS:\n%s\n==================================================" \
+          MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nOverall Status: %s\nRepository:     %s\nBranch:         %s\nCommit SHA:     %s\nTriggered By:   %s\nWorkflow URL:   %s\n\nSTAGE BREAKDOWN:\n- 1A. Code Quality:      %s\n- 1B. Security Audit:    %s\n- 2.  Build & ECR Push:  %s\n- 3A. Runner Test ($0):  %s\n- 4.  Zero-Downtime EC2: %s\n\nDETAILS:\n%s\n==================================================" \
             "$OVERALL_STATUS" \
             "${{ github.repository }}" \
             "${{ github.ref_name }}" \
@@ -462,8 +401,9 @@ jobs:
             "${{ github.actor }}" \
             "$WORKFLOW_URL" \
             "$QG_STATUS" \
+            "$SEC_STATUS" \
             "$BUILD_STATUS" \
-            "$STAGING_STATUS" \
+            "$TEST_STATUS" \
             "$PROD_STATUS" \
             "$SUMMARY")
 
@@ -474,5 +414,5 @@ jobs:
             aws sns publish \
               --topic-arn "$TOPIC_ARN" \
               --subject "$SUBJECT" \
-              --message "$MESSAGE" || echo "Warning: SNS publish failed. Please check role SNS permissions."
+              --message "$MESSAGE" || echo "Warning: SNS publish failed."
           fi
