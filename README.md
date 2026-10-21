@@ -1,118 +1,65 @@
-Project: CI/CD Login Portal Deployment on AWS EC2
-Objective:
-To deploy a static Login Portal website (HTML, CSS, JS) from GitHub onto an AWS EC2 Ubuntu web server automatically using Jenkins.
+# Login Portal - Full CI/CD on AWS
 
-Step 1: Project Setup (Local)
-Created a frontend project folder: loginproject/
-login.html
-password.html
-style.css
-javascript.js
+This repository deploys a static HTML/CSS/JavaScript website in an Nginx Docker container. The CI/CD workflow is `.github/workflows/full-cicd.yml`.
 
-Verified the project works locally on the laptop.
-Pushed the code to GitHub:
-🔗 Repository: https://github.com/yourreponame/login_portal
+## Pipeline stages
 
+1. Pull request / push to `main`.
+2. Lint and syntax checks.
+3. Docker build and local HTTP smoke tests.
+4. Trivy scan for HIGH and CRITICAL OS/library vulnerabilities (unfixed issues are ignored).
+5. Push a commit-SHA-tagged image to Amazon ECR.
+6. Deploy the image to staging EC2 and run staging HTTP smoke tests.
+7. Wait for the GitHub `production` environment approval gate.
+8. Deploy to production EC2, run a health check, and attempt rollback if the new container is unhealthy.
+9. Send the result to Amazon SNS if an SNS topic is configured.
 
-Step 2: AWS EC2 Setup
-Launched an EC2 Ubuntu instance.
-Connected using SSH:
-ssh -i "key.pem" ubuntu@<your-ec2-public-ip>
+Pull requests run the lint, build/test, and security-scan stages only. They do not deploy to AWS.
 
-Updated the system:
-sudo apt update -y
-sudo apt upgrade -y
+## Required GitHub configuration
 
+### Repository variables
 
-Installed Apache web server:
-sudo apt install apache2 -y
+- `AWS_REGION`: region containing ECR and SNS (for example `ap-south-1`).
+- `ECR_REPOSITORY`: existing ECR repository name, default `login-portal`.
 
+### Repository secrets
 
-Started and enabled Apache:
-sudo systemctl start apache2
-sudo systemctl enable apache2
+- `AWS_ROLE_ARN`: IAM role assumed through GitHub OIDC. It needs least-privilege ECR push permissions and SNS publish permission if notifications are enabled.
+- `SNS_TOPIC_ARN`: optional SNS topic ARN.
 
+### Environment: `staging`
 
-Verified by opening in browser:
-http://<EC2-Public-IP>/ 
+Create a GitHub environment named `staging` and add:
+- Secrets: `STAGING_EC2_HOST`, `STAGING_EC2_USER`, `STAGING_EC2_SSH_KEY`.
+- Variable: `STAGING_URL`, such as `http://your-staging-host`.
 
+### Environment: `production`
 
-Step 3: Jenkins Installation & Setup
-Installed Java (required for Jenkins):
-sudo apt install openjdk-17-jre -y
+Create a GitHub environment named `production`. Add:
+- Required reviewers / protection rules to enforce the manual approval gate.
+- Secrets: `PRODUCTION_EC2_HOST`, `PRODUCTION_EC2_USER`, `PRODUCTION_EC2_SSH_KEY`.
 
+Do not put real credentials in the repository. Configure an AWS IAM OIDC identity provider for `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`, and restrict the role trust policy to this repository and intended workflow/environment. GitHub Actions must be granted `id-token: write` permission to request OIDC tokens; the role itself must be scoped to only the required AWS actions.
 
-Added Jenkins repo and installed Jenkins:
-curl -fsSL https://pkg.jenkins.io/debian/jenkins.io-2023.key | sudo tee \
-/usr/share/keyrings/jenkins-keyring.asc > /dev/null
-echo deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
-https://pkg.jenkins.io/debian binary/ | sudo tee \
-/etc/apt/sources.list.d/jenkins.list > /dev/null
-sudo apt update -y
-sudo apt install jenkins -y
+## EC2 prerequisites
 
+Both EC2 instances must have Docker, AWS CLI, and curl installed. Attach an EC2 instance profile that permits pulling from the specific ECR repository. The SSH user must be able to run Docker with `sudo`. Allow inbound HTTP on port 80 from the intended test/users and restrict SSH to trusted source IPs. Staging and production should be separate hosts for this workflow because both bind container port 80.
 
-Started Jenkins:
-sudo systemctl start jenkins
-sudo systemctl enable jenkins
+The production deployment has a short interruption while the old container is stopped and the new container starts. This is a guarded replacement with rollback, **not true zero-downtime Blue-Green deployment**. True zero downtime requires a traffic switch (for example an ALB target group, reverse proxy, or equivalent) and should be added before describing this as zero downtime.
 
+## Run locally
 
-Opened Jenkins in browser:
-http://<EC2-Public-IP>:8080
+```bash
+bash tests/smoke-test.sh
+docker build -t login-portal:local .
+docker run --rm -p 8080:80 login-portal:local
+```
 
+Open `http://localhost:8080`.
 
-Step 4: Jenkins Configuration
-Unlocked Jenkins using:
-sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+## Notes
 
-
-Installed suggested plugins.
-Created admin user and logged in.
-
-Step 5: Git Configuration in Server
-Installed Git:
-sudo apt install git -y
-
-
-Configured Git username and email:
-git config --global user.name "githubname"
-git config --global user.email "yourmailid"
-
-
-🔧 Step 6: Jenkins Job Setup for Deployment
-
-Created a new Jenkins Freestyle Project named LoginPortalDeploy.
-Configured GitHub Repository URL:
-https://github.com/githubid/login_portal.git
-
-Build Trigger: Build Now (manual or automatic via GitHub webhook).
-
-Build Step (Execute Shell):
-sudo chown -R jenkins:jenkins /var/www/html
-sudo rm -rf /var/www/html/*
-sudo cp -r * /var/www/html/
-sudo chown -R www-data:www-data /var/www/html
-sudo systemctl restart apache2
-
-🧾 Step 7: Fixing Common Errors
-
-Fixed “Permission Denied” by giving Jenkins access:
-sudo chown -R jenkins:jenkins /var/www/html
-Fixed Apache startup issues by restarting:
-sudo systemctl restart apache2
-
-Renamed homepage to:
-mv login.html index.html
-
-🌐 Step 8: Accessing the Website
-✅ Successfully accessed website using
-http://Your EC2 IP/
-
-<img width="1585" height="848" alt="image" src="https://github.com/user-attachments/assets/d78cc285-9edc-42be-8384-7b834f5a5ec1" />
-<img width="1588" height="851" alt="image" src="https://github.com/user-attachments/assets/b2c4b44b-0133-45fa-8601-db5b5f13c7fb" />
-<img width="1587" height="807" alt="image" src="https://github.com/user-attachments/assets/dd04ce18-5d55-4b4d-b1eb-f6dcfa657a56" />
-
-
-
-
-
+- The contact form is currently a frontend demo; it does not send or store messages.
+- The legacy `production-pipeline.yml` is retained during migration. Disable it after validating this workflow so two workflows do not deploy concurrently.
+- Test rollback and AWS permissions in a non-production environment before using real production workloads.
