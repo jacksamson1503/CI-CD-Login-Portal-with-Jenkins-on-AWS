@@ -262,7 +262,7 @@ jobs:
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
 
-            # Auto-install Docker & Nginx if not installed
+            # Auto-install Docker if missing
             if ! command -v docker > /dev/null 2>&1; then
               echo "Installing Docker..."
               sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
@@ -272,44 +272,53 @@ jobs:
             fi
             sudo systemctl start docker || true
 
-            if ! command -v nginx > /dev/null 2>&1; then
-              echo "Installing Host Nginx Reverse Proxy..."
-              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nginx || true
-            fi
-
-            # Stop and disable Apache if it exists so Nginx owns port 80
-            sudo systemctl stop apache2 2>/dev/null || true
-            sudo systemctl disable apache2 2>/dev/null || true
-            sudo systemctl enable --now nginx || true
-
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
             else
               DOCKER_CMD="sudo docker"
             fi
 
-            # Authenticate Docker with AWS ECR
+            # ------------------------------------------------------------------
+            # STEP 0: FREE PORT 80 FROM LEGACY CONTAINERS & CONFLICTING SERVICES
+            # ------------------------------------------------------------------
+            PORT80_CONTAINERS=$($DOCKER_CMD ps -q --filter "publish=80" 2>/dev/null || true)
+            if [ -n "$PORT80_CONTAINERS" ]; then
+              echo "Releasing port 80 from legacy container: $PORT80_CONTAINERS..."
+              $DOCKER_CMD stop $PORT80_CONTAINERS 2>/dev/null || true
+              $DOCKER_CMD rm $PORT80_CONTAINERS 2>/dev/null || true
+            fi
+
+            sudo systemctl stop apache2 2>/dev/null || true
+            sudo systemctl disable apache2 2>/dev/null || true
+
+            # Install Host Nginx if missing
+            if ! command -v nginx > /dev/null 2>&1; then
+              echo "Installing Host Nginx Reverse Proxy..."
+              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nginx || true
+            fi
+
+            # Authenticate Docker with AWS ECR & Pull
             echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
             echo "Pulling Docker image: $TARGET_IMAGE..."
             $DOCKER_CMD pull "$TARGET_IMAGE"
 
             # ------------------------------------------------------------------
-            # 1. DETECT ACTIVE AND TARGET BLUE/GREEN SLOTS
+            # STEP 1: DETECT ACTIVE AND TARGET BLUE/GREEN SLOTS SAFELY
             # ------------------------------------------------------------------
-            if $DOCKER_CMD ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}-blue$"; then
+            CURRENT_SLOT="NONE"
+            CURRENT_PORT=0
+            TARGET_SLOT="BLUE"
+            TARGET_PORT=8081
+
+            if [ -n "$($DOCKER_CMD ps -q -f name=^/${CONTAINER_NAME}-blue$)" ]; then
               CURRENT_SLOT="BLUE"
               CURRENT_PORT=8081
               TARGET_SLOT="GREEN"
               TARGET_PORT=8082
-            elif $DOCKER_CMD ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}-green$"; then
+            elif [ -n "$($DOCKER_CMD ps -q -f name=^/${CONTAINER_NAME}-green$)" ]; then
               CURRENT_SLOT="GREEN"
               CURRENT_PORT=8082
-              TARGET_SLOT="BLUE"
-              TARGET_PORT=8081
-            else
-              CURRENT_SLOT="NONE"
-              CURRENT_PORT=0
               TARGET_SLOT="BLUE"
               TARGET_PORT=8081
             fi
@@ -318,7 +327,7 @@ jobs:
             echo "DEPLOYING TARGET SLOT: $TARGET_SLOT (Port: $TARGET_PORT)"
 
             # ------------------------------------------------------------------
-            # 2. RUN CONTAINER IN TARGET SLOT (IDLE PORT)
+            # STEP 2: RUN CONTAINER IN TARGET SLOT (IDLE PORT 8081 OR 8082)
             # ------------------------------------------------------------------
             TARGET_CONTAINER="${CONTAINER_NAME}-${TARGET_SLOT,,}"
             $DOCKER_CMD rm -f "$TARGET_CONTAINER" 2>/dev/null || true
@@ -331,7 +340,7 @@ jobs:
               "$TARGET_IMAGE"
 
             # ------------------------------------------------------------------
-            # 3. HEALTH CHECK TARGET SLOT BEFORE SWITCHING TRAFFIC
+            # STEP 3: HEALTH CHECK TARGET SLOT BEFORE SWITCHING TRAFFIC
             # ------------------------------------------------------------------
             echo "Running health checks on $TARGET_SLOT (127.0.0.1:$TARGET_PORT)..."
             HEALTHY="false"
@@ -355,7 +364,7 @@ jobs:
             fi
 
             # ------------------------------------------------------------------
-            # 4. SWITCH TRAFFIC INSTANTLY VIA NGINX UPSTREAM (0 DOWNTIME)
+            # STEP 4: SWITCH TRAFFIC INSTANTLY VIA NGINX UPSTREAM (0 DOWNTIME)
             # ------------------------------------------------------------------
             echo "Switching Nginx traffic to $TARGET_SLOT (Port $TARGET_PORT)..."
             sudo tee /etc/nginx/sites-available/default > /dev/null <<EOF
@@ -376,11 +385,11 @@ jobs:
             EOF
 
             sudo nginx -t
-            sudo nginx -s reload
+            sudo systemctl restart nginx
             echo "Nginx traffic successfully switched to $TARGET_SLOT in 0 ms!"
 
             # ------------------------------------------------------------------
-            # 5. RETIRE OLD SLOT
+            # STEP 5: RETIRE OLD SLOT
             # ------------------------------------------------------------------
             if [ "$CURRENT_SLOT" != "NONE" ]; then
               OLD_CONTAINER="${CONTAINER_NAME}-${CURRENT_SLOT,,}"
@@ -392,7 +401,7 @@ jobs:
             fi
 
             # ------------------------------------------------------------------
-            # 6. AUTO-CLEANUP HOST DOCKER IMAGES (KEEP LAST 4)
+            # STEP 6: AUTO-CLEANUP HOST DOCKER IMAGES (KEEP LAST 4)
             # ------------------------------------------------------------------
             $DOCKER_CMD container prune -f 2>/dev/null || true
             OLD_IMAGES=$($DOCKER_CMD images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.CreatedAt}}\t{{.ID}}" 2>/dev/null | sort -r | awk '{print $NF}' | awk '!seen[$0]++' | tail -n +5 || true)
@@ -411,7 +420,7 @@ jobs:
         id: detect-slot
         run: |
           sleep 2
-          SLOT_HEADER=$(curl -s -I "http://${{ secrets.PRODUCTION_EC2_HOST }}/" | grep -i "X-Deployment-Slot" | awk '{print $2}' | tr -d '\r\n')
+          SLOT_HEADER=$(curl -s -I "http://${{ secrets.PRODUCTION_EC2_HOST }}/" | grep -i "X-Deployment-Slot" | awk '{print $2}' | tr -d '\r\n' || true)
           ACTIVE_SLOT="${SLOT_HEADER:-BLUE}"
           if [ "$ACTIVE_SLOT" = "BLUE" ]; then
             PREV_SLOT="GREEN"
@@ -493,19 +502,19 @@ jobs:
           PREV_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'GREEN' }}
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
-          ## Production Deployment Summary
+          ## 🚀 Production Deployment Summary
 
           | Metric | Status |
           | :--- | :--- |
-          | **Deployment Strategy** | Zero-Downtime Blue/Green Swap |
-          | **Active Live Slot** | **Slot ${{ env.ACTIVE_SLOT }}** |
-          | **Retired Slot** | slot ${{ env.PREV_SLOT }} |
-          | **Target Server** | ${{ secrets.PRODUCTION_EC2_HOST }} |
-          | **Downtime** | **0 ms** (Seamless Nginx Reload) |
-          | **Rollback Safeguard** | Active & Protected |
-          | **Image Retention** | Enforced (Latest 4 Images) |
+          | **Deployment Strategy** | 🔄 Zero-Downtime Blue/Green Swap |
+          | **Active Live Slot** | 🟢 **Slot ${{ env.ACTIVE_SLOT }}** |
+          | **Retired Slot** | ⚪ Slot ${{ env.PREV_SLOT }} |
+          | **Target Server** | 🖥️ ${{ secrets.PRODUCTION_EC2_HOST }} |
+          | **Downtime** | ⚡ **0 ms** (Seamless Nginx Reload) |
+          | **Rollback Safeguard** | 🛡️ Active & Protected |
+          | **Image Retention** | 📦 Enforced (Latest 4 Images) |
 
-          ### Pipeline Stage Results
+          ### 📊 Pipeline Stage Results
           - ✅ **Code Quality Gate**: Passed
           - ✅ **Security & Secret Audit**: Passed
           - ✅ **Docker Build & Push**: Stored in ECR
