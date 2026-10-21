@@ -12,7 +12,7 @@ permissions:
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: login-portal
-  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:181188392988:aws-daily-operations-report
+  SNS_TOPIC_ARN: 
   CONTAINER_NAME: login-portal
 
 jobs:
