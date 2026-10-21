@@ -11,10 +11,10 @@ permissions:
   id-token: write   # REQUIRED for AWS OIDC authentication
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY || 'login-portal' }}
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: login-portal
   CONTAINER_NAME: login-portal
-  SNS_TOPIC_ARN: ${{ secrets.SNS_TOPIC_ARN || '' }}
+  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:181188392988:aws-daily-operations-report
 
 jobs:
   # =========================================================================
@@ -65,10 +65,8 @@ jobs:
     needs: [quality-gate]
     runs-on: ubuntu-latest
     outputs:
-      image: ${{ steps.build-image.outputs.image }}
-      image_tag: ${{ steps.set-tag.outputs.image_tag }}
       ecr_registry: ${{ steps.login-ecr.outputs.registry }}
-      ecr_repository: ${{ steps.build-image.outputs.ecr_repository }}
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -90,7 +88,6 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Build, Tag, and Push Docker Image to Amazon ECR
-        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
@@ -106,17 +103,13 @@ jobs:
           echo "Verifying pushed images in AWS ECR..."
           aws ecr describe-images --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --query 'imageDetails[*].imageTags' --output text || true
 
-          echo "image=$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "ecr_repository=$TARGET_REPO" >> $GITHUB_OUTPUT
-          echo "Docker image stored in ECR successfully."
-
       - name: Retain Only Last 4 Images in AWS ECR
         env:
           TARGET_REPO: ${{ env.ECR_REPOSITORY }}
         run: |
-          echo "Checking ECR image retention policy (Keeping only last 4 images)..."
+          echo "Enforcing ECR retention policy: keeping only last 4 images..."
           
-          # Delete any untagged/orphaned images first
+          # Delete any untagged images first
           UNTAGGED_DIGESTS=$(aws ecr list-images \
             --repository-name "$TARGET_REPO" \
             --region ${{ env.AWS_REGION }} \
@@ -142,7 +135,7 @@ jobs:
               echo "Pruning older ECR image: $digest"
               aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
             done
-            echo "ECR cleanup complete: only the 4 newest images are preserved."
+            echo "ECR cleanup complete."
           else
             echo "Total images in ECR is within the 4 image limit."
           fi
@@ -162,20 +155,23 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Generate ECR Auth Token for EC2
-        id: ecr-token
+      - name: Prepare Deployment Variables
+        id: prep
         run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
 
       - name: SSH to Dev-server & Execute Deployment
         uses: appleboy/ssh-action@v1.0.3
         env:
-          ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
+          ECR_REGISTRY: ${{ steps.prep.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_TOKEN: ${{ steps.prep.outputs.token }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
           host: ${{ secrets.STAGING_EC2_HOST }}
@@ -190,6 +186,15 @@ jobs:
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
+
+            # Auto-install Docker and curl if not present
+            if ! command -v docker > /dev/null 2>&1; then
+              echo "Docker not found on host. Auto-installing Docker..."
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io curl
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER" 2>/dev/null || true
+            fi
 
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
@@ -270,20 +275,23 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Generate ECR Auth Token for EC2
-        id: ecr-token
+      - name: Prepare Deployment Variables
+        id: prep
         run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
 
       - name: SSH to Prod-server & Execute Production Deployment
         uses: appleboy/ssh-action@v1.0.3
         env:
-          ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
-          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
+          ECR_REGISTRY: ${{ steps.prep.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+          ECR_TOKEN: ${{ steps.prep.outputs.token }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
           host: ${{ secrets.PRODUCTION_EC2_HOST }}
@@ -298,6 +306,15 @@ jobs:
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
+
+            # Auto-install Docker and curl if not present
+            if ! command -v docker > /dev/null 2>&1; then
+              echo "Docker not found on host. Auto-installing Docker..."
+              sudo apt-get update -y
+              sudo apt-get install -y docker.io curl
+              sudo systemctl enable --now docker
+              sudo usermod -aG docker "$USER" 2>/dev/null || true
+            fi
 
             if docker info > /dev/null 2>&1; then
               DOCKER_CMD="docker"
@@ -394,26 +411,58 @@ jobs:
             echo "=========================================================="
 
   # =========================================================================
-  # STAGE 5: NOTIFICATION REPORT
+  # STAGE 5: NOTIFICATION REPORT TO EMAIL VIA AWS SNS
   # =========================================================================
   notify:
-    name: Operations Summary
+    name: Operations Summary & SNS Email
     needs: [quality-gate, build-and-push, deploy-staging, deploy-production]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Print Deployment Status Summary
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publish Operations Report to SNS Email
         env:
           QG_STATUS: ${{ needs.quality-gate.result }}
           BUILD_STATUS: ${{ needs.build-and-push.result }}
           STAGING_STATUS: ${{ needs.deploy-staging.result }}
           PROD_STATUS: ${{ needs.deploy-production.result }}
+          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
         run: |
-          echo "=================================================="
-          echo "AWS CI/CD PIPELINE SUMMARY"
-          echo "=================================================="
-          echo "Quality Gate: $QG_STATUS"
-          echo "ECR Build & Push: $BUILD_STATUS"
-          echo "Dev-server (Staging): $STAGING_STATUS"
-          echo "Prod-server (Production): $PROD_STATUS"
-          echo "=================================================="
+          if [ "$QG_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$STAGING_STATUS" = "success" ] && [ "$PROD_STATUS" = "success" ]; then
+            OVERALL_STATUS="SUCCESS"
+            SUBJECT="[CI/CD SUCCESS] Staging & Production Deployment Succeeded - ${{ github.repository }}"
+            SUMMARY="All stages passed successfully! The application container is running and healthy on both Dev-server and Prod-server."
+          else
+            OVERALL_STATUS="FAILED"
+            SUBJECT="[CI/CD ALERT] Deployment Failed - ${{ github.repository }}"
+            SUMMARY="The pipeline encountered a failure during execution. Check the logs for details."
+          fi
+
+          MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nOverall Status: %s\nRepository:     %s\nBranch:         %s\nCommit SHA:     %s\nTriggered By:   %s\nWorkflow URL:   %s\n\nSTAGE BREAKDOWN:\n- 1. Quality Gate:       %s\n- 2. Build & ECR Push:   %s\n- 3. Dev-server Staging: %s\n- 4. Prod-server Deploy: %s\n\nDETAILS:\n%s\n==================================================" \
+            "$OVERALL_STATUS" \
+            "${{ github.repository }}" \
+            "${{ github.ref_name }}" \
+            "${{ github.sha }}" \
+            "${{ github.actor }}" \
+            "$WORKFLOW_URL" \
+            "$QG_STATUS" \
+            "$BUILD_STATUS" \
+            "$STAGING_STATUS" \
+            "$PROD_STATUS" \
+            "$SUMMARY")
+
+          echo "$MESSAGE"
+
+          if [ -n "$TOPIC_ARN" ]; then
+            echo "Publishing Operations Report to SNS: $TOPIC_ARN..."
+            aws sns publish \
+              --topic-arn "$TOPIC_ARN" \
+              --subject "$SUBJECT" \
+              --message "$MESSAGE" || echo "Warning: SNS publish failed. Please check role SNS permissions."
+          
