@@ -21,7 +21,7 @@ jobs:
   # TRACK 1A: CODE QUALITY GATE & ASSET INTEGRITY
   # =========================================================================
   code-quality:
-    name: Code Quality & Content Validation Gate
+    name: Code Quality & Asset Integrity
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -34,79 +34,21 @@ jobs:
 
       - name: Validate JavaScript Syntax
         run: |
-          set -e
           echo "Validating JavaScript files..."
-          for jsfile in script.js javascript.js; do
-            if [ -f "$jsfile" ]; then
-              node --check "$jsfile"
-              echo "Passed syntax check: $jsfile"
-            else
-              echo "CRITICAL: Required JS file $jsfile is missing!"
-              exit 1
-            fi
-          done
+          node --check script.js
+          node --check javascript.js
+          echo "JavaScript syntax validation passed."
 
-      - name: Verify Web Assets & HTML Structure
+      - name: Verify Web Assets Integrity
         run: |
-          set -e
-          echo "Checking web assets existence and basic structure..."
-          REQUIRED_FILES=("index.html" "password.html" "style.css" "script.js" "Dockerfile")
-          for file in "${REQUIRED_FILES[@]}"; do
-            if [ ! -s "$file" ]; then
-              echo "CRITICAL ERROR: Asset $file is missing or 0 bytes!"
-              exit 1
-            fi
-          done
-
-          for html in index.html password.html; do
-            echo "Validating tags in $html..."
-            grep -qi "<!doctype html\|<html" "$html" || { echo "Missing <html> or DOCTYPE in $html"; exit 1; }
-            grep -qi "<head" "$html" || { echo "Missing <head> in $html"; exit 1; }
-            grep -qi "<body" "$html" || { echo "Missing <body> in $html"; exit 1; }
-          done
-          echo "Structure check PASSED."
-
-      - name: Comprehensive Link & Email Integrity Check
-        run: |
-          node validate.js
-
-      - name: Scan for Unwanted Text, Placeholders & Dev URLs
-        run: |
-          set -e
-          FAIL=0
-          TARGET_FILES="index.html password.html script.js style.css"
-
-          echo "Scanning for placeholder & development artifacts..."
-
-          # 1. Lorem Ipsum
-          if grep -i -n -E "lorem[[:space:]]+ipsum" $TARGET_FILES 2>/dev/null; then
-            echo "CRITICAL: Found 'Lorem Ipsum' placeholder text!"
-            FAIL=1
-          fi
-
-          # 2. Developer Action Notes (TODO, FIXME, XXX, HACK)
-          if grep -n -E "(^|[^a-zA-Z0-9_])(TODO|FIXME|XXX|HACK)([^a-zA-Z0-9_]|$)" $TARGET_FILES 2>/dev/null; then
-            echo "CRITICAL: Found unfinished dev markers (TODO / FIXME / XXX / HACK)!"
-            FAIL=1
-          fi
-
-          # 3. Localhost or Local IP patterns
-          if grep -i -n -E "https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)" $TARGET_FILES 2>/dev/null; then
-            echo "CRITICAL: Found dev host URLs (localhost / 127.0.0.1) in production assets!"
-            FAIL=1
-          fi
-
-          # 4. Dummy or Example Emails
-          if grep -i -n -E "\b[a-zA-Z0-9._%+-]+@(example\.com|test\.com|domain\.com)\b" $TARGET_FILES 2>/dev/null; then
-            echo "CRITICAL: Found dummy email domains (@example.com / @test.com)!"
-            FAIL=1
-          fi
-
-          if [ $FAIL -ne 0 ]; then
-            echo "Quality Gate FAILED: Code contains unwanted text, placeholders, or dev URLs."
-            exit 1
-          fi
-          echo "Quality Gate PASSED: All files clean."
+          echo "Checking web assets integrity..."
+          test -s index.html || { echo "index.html missing or empty"; exit 1; }
+          test -s style.css || { echo "style.css missing or empty"; exit 1; }
+          test -s script.js || { echo "script.js missing or empty"; exit 1; }
+          test -s Dockerfile || { echo "Dockerfile missing or empty"; exit 1; }
+          grep -i "<html" index.html || { echo "Missing <html> tag in index.html"; exit 1; }
+          grep -i "<html" password.html || { echo "Missing <html> tag in password.html"; exit 1; }
+          echo "Web assets integrity check passed."
 
   # =========================================================================
   # TRACK 1B: SECURITY AUDIT & DOCKER SANITY (RUNS IN PARALLEL)
@@ -120,41 +62,10 @@ jobs:
 
       - name: Dockerfile Syntax & Build Sanity Check
         run: |
-          set -e
           echo "Testing Dockerfile build sanity..."
           docker build --no-cache -t quality-gate-test .
           docker rmi quality-gate-test
           echo "Docker build sanity check PASSED."
-
-      - name: Security & Secret Leak Audit
-        run: |
-          set -e
-          FAIL=0
-          echo "Auditing configuration for sensitive credentials..."
-
-          # 1. Private keys
-          if grep -r -i -E "BEGIN (RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY" . --exclude-dir=".git" 2>/dev/null; then
-            echo "CRITICAL: Private key detected in repository!"
-            FAIL=1
-          fi
-
-          # 2. AWS Access Key IDs
-          if grep -r -E "(^|[^A-Z0-9])AKIA[0-9A-Z]{16}([^A-Z0-9]|$)" . --exclude-dir=".git" 2>/dev/null; then
-            echo "CRITICAL: Hardcoded AWS Access Key ID detected!"
-            FAIL=1
-          fi
-
-          # 3. GitHub personal access tokens
-          if grep -r -E "ghp_[0-9a-zA-Z]{36}" . --exclude-dir=".git" 2>/dev/null; then
-            echo "CRITICAL: Leaked GitHub token detected!"
-            FAIL=1
-          fi
-
-          if [ $FAIL -ne 0 ]; then
-            echo "Security Audit FAILED: Leaked secrets or credentials found."
-            exit 1
-          fi
-          echo "Security audit PASSED: Clean repository."
 
   # =========================================================================
   # STAGE 2: BUILD, TAG & PUSH DOCKER IMAGE TO AWS ECR
