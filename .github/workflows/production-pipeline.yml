@@ -1,4 +1,4 @@
-name: Production CI/CD Pipeline
+name: Production & Staging CI/CD Pipeline
 
 on:
   push:
@@ -11,11 +11,10 @@ permissions:
   id-token: write   # REQUIRED for AWS OIDC authentication
 
 env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: login-portal
-  SNS_TOPIC_ARN: arn:aws:sns:us-east-1:181188392988:aws-daily-operations-report
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY || 'login-portal' }}
   CONTAINER_NAME: login-portal
-  AWS_ROLE_ARN: arn:aws:iam::181188392988:role/GitHubActions-ECR-Deploy
+  SNS_TOPIC_ARN: ${{ secrets.SNS_TOPIC_ARN || '' }}
 
 jobs:
   # =========================================================================
@@ -59,7 +58,7 @@ jobs:
           echo "Dockerfile quality gate passed."
 
   # =========================================================================
-  # STAGE 2: BUILD & PUSH DOCKER IMAGE TO AWS ECR
+  # STAGE 2: BUILD, PUSH & AUTO-CLEANUP IN AWS ECR (KEEP LAST 4)
   # =========================================================================
   build-and-push:
     name: Build & Store Image in AWS ECR
@@ -77,7 +76,7 @@ jobs:
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
@@ -95,12 +94,8 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
-          CUSTOM_ECR_REPO: ${{ secrets.ECR_REPOSITORY }}
+          TARGET_REPO: ${{ env.ECR_REPOSITORY }}
         run: |
-          TARGET_REPO="${CUSTOM_ECR_REPO:-login-portal}"
-          if [ -z "$TARGET_REPO" ]; then
-            TARGET_REPO="login-portal"
-          fi
           echo "Building Docker image: $ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
           docker build -t "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" -t "$ECR_REGISTRY/$TARGET_REPO:latest" .
           
@@ -115,18 +110,56 @@ jobs:
           echo "ecr_repository=$TARGET_REPO" >> $GITHUB_OUTPUT
           echo "Docker image stored in ECR successfully."
 
+      - name: Retain Only Last 4 Images in AWS ECR
+        env:
+          TARGET_REPO: ${{ env.ECR_REPOSITORY }}
+        run: |
+          echo "Checking ECR image retention policy (Keeping only last 4 images)..."
+          
+          # Delete any untagged/orphaned images first
+          UNTAGGED_DIGESTS=$(aws ecr list-images \
+            --repository-name "$TARGET_REPO" \
+            --region ${{ env.AWS_REGION }} \
+            --filter tagStatus=UNTAGGED \
+            --query 'imageIds[*].imageDigest' \
+            --output text 2>/dev/null || true)
+          
+          if [ -n "$UNTAGGED_DIGESTS" ] && [ "$UNTAGGED_DIGESTS" != "None" ]; then
+            for digest in $UNTAGGED_DIGESTS; do
+              aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
+            done
+          fi
+
+          # Find digests older than the top 4 most recent images
+          OLD_ECR_DIGESTS=$(aws ecr describe-images \
+            --repository-name "$TARGET_REPO" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'reverse(sort_by(imageDetails,&imagePushedAt))[4:].imageDigest' \
+            --output text 2>/dev/null || true)
+
+          if [ -n "$OLD_ECR_DIGESTS" ] && [ "$OLD_ECR_DIGESTS" != "None" ]; then
+            for digest in $OLD_ECR_DIGESTS; do
+              echo "Pruning older ECR image: $digest"
+              aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
+            done
+            echo "ECR cleanup complete: only the 4 newest images are preserved."
+          else
+            echo "Total images in ECR is within the 4 image limit."
+          fi
+
   # =========================================================================
-  # STAGE 3: DEPLOY TO AWS EC2 WITH AUTOMATIC ROLLBACK
+  # STAGE 3: DEPLOY TO DEV-SERVER (STAGING ENVIRONMENT)
   # =========================================================================
-  deploy:
-    name: Deploy to EC2 with Automated Rollback
+  deploy-staging:
+    name: Deploy to Dev-server (Staging)
     needs: [build-and-push]
     runs-on: ubuntu-latest
+    environment: staging
     steps:
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Generate ECR Auth Token for EC2
@@ -136,24 +169,132 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-      - name: SSH to EC2 & Execute Production Deployment
+      - name: SSH to Dev-server & Execute Deployment
         uses: appleboy/ssh-action@v1.0.3
         env:
           ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository || 'login-portal' }}
+          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository }}
           IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
           ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
+          host: ${{ secrets.STAGING_EC2_HOST }}
+          username: ${{ secrets.STAGING_EC2_USER }}
+          key: ${{ secrets.STAGING_EC2_SSH_KEY || secrets.EC2_SSH_KEY }}
           envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ECR_TOKEN,CONTAINER_NAME
           script_stop: true
           script: |
             set -e
             echo "=========================================================="
-            echo "STARTING REAL-TIME PRODUCTION DEPLOYMENT"
+            echo "STARTING DEPLOYMENT ON DEV-SERVER (STAGING)"
+            TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+            echo "Target Image: $TARGET_IMAGE"
+            echo "=========================================================="
+
+            if docker info > /dev/null 2>&1; then
+              DOCKER_CMD="docker"
+            else
+              DOCKER_CMD="sudo docker"
+            fi
+
+            # Step 1: Login Docker to ECR
+            echo "Authenticating Docker with Amazon ECR on Dev-server..."
+            echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            # Step 2: Pull Target Image
+            echo "Pulling Docker image: $TARGET_IMAGE..."
+            $DOCKER_CMD pull "$TARGET_IMAGE"
+
+            # Step 3: Stop & Remove old container if present
+            echo "Stopping old container if present..."
+            $DOCKER_CMD rm -f "$CONTAINER_NAME" 2>/dev/null || true
+
+            # Free port 80 from host web servers if any
+            sudo systemctl stop apache2 2>/dev/null || true
+            sudo systemctl stop nginx 2>/dev/null || true
+
+            # Step 4: Run New Container
+            echo "Launching new container on port 80..."
+            $DOCKER_CMD run -d \
+              --name "$CONTAINER_NAME" \
+              -p 80:80 \
+              --restart unless-stopped \
+              "$TARGET_IMAGE"
+
+            # Step 5: Verification & Health Check
+            echo "Running health checks on Dev-server..."
+            HEALTH_PASSED="false"
+            for i in 1 2 3 4 5; do
+              sleep 4
+              if curl -s -f --connect-timeout 3 http://localhost:80/ > /dev/null 2>&1 || curl -s -f --connect-timeout 3 http://localhost:80/index.html > /dev/null 2>&1; then
+                echo "Health check attempt $i: PASSED! Dev-server is live."
+                HEALTH_PASSED="true"
+                break
+              else
+                echo "Health check attempt $i: Waiting for container response..."
+              fi
+            done
+
+            if [ "$HEALTH_PASSED" != "true" ]; then
+              echo "Health check FAILED on Dev-server!"
+              exit 1
+            fi
+
+            # Step 6: Host Docker Cleanup (Keep only running container & last 4 images)
+            echo "Performing Docker cleanup on Dev-server..."
+            $DOCKER_CMD container prune -f 2>/dev/null || true
+
+            OLD_IMAGES=$($DOCKER_CMD images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.CreatedAt}}\t{{.ID}}" 2>/dev/null | sort -r | awk '{print $NF}' | awk '!seen[$0]++' | tail -n +5 || true)
+            if [ -n "$OLD_IMAGES" ]; then
+              echo "Deleting older Docker images beyond latest 4 on Dev-server: $OLD_IMAGES"
+              echo "$OLD_IMAGES" | xargs -r $DOCKER_CMD rmi -f 2>/dev/null || true
+            fi
+            $DOCKER_CMD image prune -f 2>/dev/null || true
+
+            echo "=========================================================="
+            echo "DEV-SERVER (STAGING) DEPLOYMENT COMPLETED SUCCESSFULLY!"
+            echo "=========================================================="
+
+  # =========================================================================
+  # STAGE 4: DEPLOY TO PROD-SERVER (PRODUCTION ENVIRONMENT)
+  # =========================================================================
+  deploy-production:
+    name: Deploy to Prod-server (Production)
+    needs: [build-and-push, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate ECR Auth Token for EC2
+        id: ecr-token
+        run: |
+          TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: SSH to Prod-server & Execute Production Deployment
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ needs.build-and-push.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        with:
+          host: ${{ secrets.PRODUCTION_EC2_HOST }}
+          username: ${{ secrets.PRODUCTION_EC2_USER }}
+          key: ${{ secrets.PRODUCTION_EC2_SSH_KEY || secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ECR_TOKEN,CONTAINER_NAME
+          script_stop: true
+          script: |
+            set -e
+            echo "=========================================================="
+            echo "STARTING REAL-TIME PRODUCTION DEPLOYMENT ON PROD-SERVER"
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
             echo "Target Image: $TARGET_IMAGE"
             echo "=========================================================="
@@ -167,7 +308,6 @@ jobs:
             # Step 1: AWS ECR Authentication on EC2
             echo "Step 1: Authenticating Docker with Amazon ECR..."
             echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
-            echo "$ECR_TOKEN" | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY" 2>/dev/null || true
 
             # Step 2: Pull New Image with fallback
             echo "Step 2: Pulling new image from ECR..."
@@ -177,10 +317,9 @@ jobs:
               $DOCKER_CMD pull "$TARGET_IMAGE"
             fi
 
-            # Step 3: Backup existing container for instant rollback
+            # Step 3: Backup existing container for instant rollback safeguard
             echo "Step 3: Staging existing container for rollback safeguard..."
             BACKUP_CONTAINER="${CONTAINER_NAME}-backup"
-            
             $DOCKER_CMD rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
 
             HAS_PREVIOUS="false"
@@ -193,8 +332,9 @@ jobs:
               $DOCKER_CMD rm -f "$CONTAINER_NAME"
             fi
 
-            # Ensure port 80 is free from existing system web servers (like Apache)
+            # Ensure port 80 is free from existing system web servers
             sudo systemctl stop apache2 2>/dev/null || true
+            sudo systemctl stop nginx 2>/dev/null || true
 
             # Step 4: Run New Container
             echo "Step 4: Launching new container ($CONTAINER_NAME)..."
@@ -205,7 +345,7 @@ jobs:
               "$TARGET_IMAGE"
 
             # Step 5: Automated Health Check with Auto-Rollback
-            echo "Step 5: Verifying container health..."
+            echo "Step 5: Verifying container health on Prod-server..."
             HEALTH_CHECK_PASSED="false"
             for i in 1 2 3 4 5; do
               sleep 4
@@ -220,78 +360,60 @@ jobs:
 
             # Step 6: Rollback Evaluation
             if [ "$HEALTH_CHECK_PASSED" != "true" ]; then
-              echo "CRITICAL: Health check FAILED! Stopping pipeline and initiating automatic rollback..."
+              echo "CRITICAL: Health check FAILED! Initiating automatic rollback..."
               $DOCKER_CMD rm -f "$CONTAINER_NAME" 2>/dev/null || true
               
               if [ "$HAS_PREVIOUS" = "true" ]; then
                 echo "Restoring previous working container ($BACKUP_CONTAINER -> $CONTAINER_NAME)..."
                 $DOCKER_CMD rename "$BACKUP_CONTAINER" "$CONTAINER_NAME"
                 $DOCKER_CMD start "$CONTAINER_NAME"
-                echo "Rollback successful: Previous working version restored and serving traffic."
+                echo "Rollback successful: Previous working version restored."
               else
                 echo "No previous running container was available to restore."
               fi
               exit 1
             fi
 
-            # Cleanup backup container on success
+            # Step 7: Cleanup backup container on success
             echo "Step 7: Deployment verified healthy. Cleaning up backup container..."
             $DOCKER_CMD rm -f "$BACKUP_CONTAINER" 2>/dev/null || true
+
+            # Step 8: Auto-Cleanup: Keep only active container & last 4 Docker images
+            echo "Step 8: Performing Docker host cleanup on Prod-server..."
+            $DOCKER_CMD container prune -f 2>/dev/null || true
+
+            OLD_IMAGES=$($DOCKER_CMD images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.CreatedAt}}\t{{.ID}}" 2>/dev/null | sort -r | awk '{print $NF}' | awk '!seen[$0]++' | tail -n +5 || true)
+            if [ -n "$OLD_IMAGES" ]; then
+              echo "Deleting older Docker images beyond latest 4 on Prod-server: $OLD_IMAGES"
+              echo "$OLD_IMAGES" | xargs -r $DOCKER_CMD rmi -f 2>/dev/null || true
+            fi
+            $DOCKER_CMD image prune -f 2>/dev/null || true
+
             echo "=========================================================="
-            echo "PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
+            echo "PROD-SERVER PRODUCTION DEPLOYMENT FINISHED SUCCESSFULLY!"
             echo "=========================================================="
 
   # =========================================================================
-  # STAGE 4: AWS SNS NOTIFICATION (ALWAYS RUNS ON SUCCESS OR FAILURE)
+  # STAGE 5: NOTIFICATION REPORT
   # =========================================================================
-  notify-sns:
-    name: Send SNS Operations Report
-    needs: [quality-gate, build-and-push, deploy]
+  notify:
+    name: Operations Summary
+    needs: [quality-gate, build-and-push, deploy-staging, deploy-production]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Publish Notification to AWS SNS
+      - name: Print Deployment Status Summary
         env:
           QG_STATUS: ${{ needs.quality-gate.result }}
           BUILD_STATUS: ${{ needs.build-and-push.result }}
-          DEPLOY_STATUS: ${{ needs.deploy.result }}
-          WORKFLOW_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STAGING_STATUS: ${{ needs.deploy-staging.result }}
+          PROD_STATUS: ${{ needs.deploy-production.result }}
         run: |
-          if [ "$QG_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$DEPLOY_STATUS" = "success" ]; then
-            OVERALL_STATUS="SUCCESSFUL"
-            SUBJECT="[CI/CD SUCCESS] Production Deployment Succeeded - ${{ github.repository }}"
-            SUMMARY="All stages passed successfully. The new Docker container is running and healthy on EC2."
-          else
-            OVERALL_STATUS="FAILED"
-            SUBJECT="[CI/CD FAILURE / ROLLBACK] Deployment Alert - ${{ github.repository }}"
-            SUMMARY="The pipeline encountered a failure and was halted."
-          fi
-
-          MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nStatus: %s\nRepository: %s\nBranch: %s\nCommit SHA: %s\nTriggered By: %s\nWorkflow URL: %s\n\nSTAGE BREAKDOWN:\n- Quality Gate: %s\n- Build & ECR Push: %s\n- EC2 Deployment: %s\n\nDETAILS:\n%s\n==================================================" \
-            "$OVERALL_STATUS" \
-            "${{ github.repository }}" \
-            "${{ github.ref_name }}" \
-            "${{ github.sha }}" \
-            "${{ github.actor }}" \
-            "$WORKFLOW_RUN_URL" \
-            "$QG_STATUS" \
-            "$BUILD_STATUS" \
-            "$DEPLOY_STATUS" \
-            "$SUMMARY")
-
-          if [ -n "${{ env.SNS_TOPIC_ARN }}" ]; then
-            echo "Publishing to SNS: ${{ env.SNS_TOPIC_ARN }}"
-            aws sns publish \
-              --topic-arn "${{ env.SNS_TOPIC_ARN }}" \
-              --subject "$SUBJECT" \
-              --message "$MESSAGE"
-            echo "AWS SNS Notification sent successfully."
-          else
-            echo "SNS_TOPIC_ARN is empty, skipping notification."
-          fi
+          echo "=================================================="
+          echo "AWS CI/CD PIPELINE SUMMARY"
+          echo "=================================================="
+          echo "Quality Gate: $QG_STATUS"
+          echo "ECR Build & Push: $BUILD_STATUS"
+          echo "Dev-server (Staging): $STAGING_STATUS"
+          echo "Prod-server (Production): $PROD_STATUS"
+          echo "=================================================="
