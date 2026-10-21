@@ -449,20 +449,23 @@ jobs:
           WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
         run: |
+          ACTIVE_SLOT_CLEAN=$(echo "${ACTIVE_SLOT:-GREEN}" | tr -d '\r\n ' )
+          PREV_SLOT_CLEAN=$(echo "${PREVIOUS_SLOT:-BLUE}" | tr -d '\r\n ' )
+
           if [ "$QG_STATUS" = "success" ] && [ "$SEC_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$TEST_STATUS" = "success" ] && [ "$PROD_STATUS" = "success" ]; then
             OVERALL_STATUS="SUCCESSFUL"
-            SUBJECT="[CI/CD SUCCESS] Zero-Downtime Blue/Green Swap ($ACTIVE_SLOT) - ${{ github.repository }}"
-            SUMMARY="The pipeline completed a zero-downtime Blue/Green swap. Traffic is now actively routed to Slot $ACTIVE_SLOT via Nginx."
+            SUBJECT="[CI/CD SUCCESS] Blue/Green Swap ($ACTIVE_SLOT_CLEAN)"
+            SUMMARY="The pipeline completed a zero-downtime Blue/Green swap. Traffic is now actively routed to Slot $ACTIVE_SLOT_CLEAN via Nginx."
           else
             OVERALL_STATUS="FAILED"
-            SUBJECT="[CI/CD ALERT] Deployment Failed - ${{ github.repository }}"
+            SUBJECT="[CI/CD ALERT] Deployment Failed"
             SUMMARY="The deployment halted during execution. Any active production slot remained safe and serving traffic."
           fi
 
           MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nOverall Status:   %s\nDeployment Type:  Zero-Downtime Blue/Green (Nginx)\nActive Slot:      Slot %s\nRetired Slot:     Slot %s\nRepository:       %s\nBranch:           %s\nCommit SHA:       %s\nTriggered By:     %s\nWorkflow URL:     %s\n\nSTAGE BREAKDOWN:\n- 1A. Code Quality Gate:   %s\n- 1B. Security Audit:      %s\n- 2.  Build & ECR Push:    %s\n- 3A. Runner Staging Test: %s\n- 4.  Blue/Green Deploy:   %s\n\nDETAILS:\n%s\n==================================================" \
             "$OVERALL_STATUS" \
-            "$ACTIVE_SLOT" \
-            "$PREVIOUS_SLOT" \
+            "$ACTIVE_SLOT_CLEAN" \
+            "$PREV_SLOT_CLEAN" \
             "${{ github.repository }}" \
             "${{ github.ref_name }}" \
             "${{ github.sha }}" \
