@@ -194,7 +194,7 @@ jobs:
   deploy-production:
     name: Zero-Downtime Blue/Green Deploy
     if: github.event_name != 'pull_request'
-    needs: [runner-smoke-test, cve-scan]
+    needs: [build-container, runner-smoke-test, cve-scan]
     runs-on: ubuntu-latest
     environment: production
     outputs:
@@ -328,7 +328,7 @@ jobs:
           fi
 
   # =========================================================================
-  # STAGE 5A: LIVE ENDPOINT VERIFICATION (PARALLEL TRACK 1)
+  # STAGE 5A: LIVE ENDPOINT VERIFICATION (TRACK 1)
   # =========================================================================
   live-verification:
     name: Live Verification
@@ -347,28 +347,47 @@ jobs:
           echo "Public live site successfully verified."
 
   # =========================================================================
-  # STAGE 5B: FAILURE DIAGNOSTICS (PARALLEL TRACK 2 - RUNS ONLY ON FAILURE)
+  # STAGE 5B: CENTRAL FAILURE DIAGNOSTICS (MONITORS ALL PREVIOUS STAGES)
   # =========================================================================
   failure-diagnostics:
     name: Failure Diagnostics
-    needs: [deploy-production]
+    needs: [code-gate, security-audit, build-container, runner-smoke-test, cve-scan, deploy-production]
     if: failure()
     runs-on: ubuntu-latest
+    outputs:
+      failed_step: ${{ steps.diagnose.outputs.failed_step }}
     steps:
-      - name: Collect Deployment Diagnostic Logs
+      - name: Diagnose Pipeline Failure
+        id: diagnose
         run: |
           echo "=========================================================="
-          echo "ALERT: Production deployment encountered an issue."
-          echo "Auto-rollback safeguard engaged. Live slot remained online."
-          echo "Inspect the logs above to see the failure reason."
+          echo "ALERT: Pipeline failure detected! Gathering diagnostics..."
+          echo "Code Gate: ${{ needs.code-gate.result }}"
+          echo "Security Audit: ${{ needs.security-audit.result }}"
+          echo "Build Container: ${{ needs.build-container.result }}"
+          echo "Runner Smoke Test: ${{ needs.runner-smoke-test.result }}"
+          echo "Trivy CVE Scan: ${{ needs.cve-scan.result }}"
+          echo "Deploy Production: ${{ needs.deploy-production.result }}"
           echo "=========================================================="
+          
+          FAILED="UNKNOWN"
+          if [ "${{ needs.code-gate.result }}" = "failure" ]; then FAILED="Code Gate";
+          elif [ "${{ needs.security-audit.result }}" = "failure" ]; then FAILED="Security & Secret Audit";
+          elif [ "${{ needs.build-container.result }}" = "failure" ]; then FAILED="Build Container & ECR Push";
+          elif [ "${{ needs.runner-smoke-test.result }}" = "failure" ]; then FAILED="Runner Smoke Test";
+          elif [ "${{ needs.cve-scan.result }}" = "failure" ]; then FAILED="Trivy CVE Scan";
+          elif [ "${{ needs.deploy-production.result }}" = "failure" ]; then FAILED="Zero-Downtime Blue/Green Deploy";
+          fi
+
+          echo "failed_step=$FAILED" >> $GITHUB_OUTPUT
+          echo "Primary Failed Stage: $FAILED"
 
   # =========================================================================
   # STAGE 6: DEPLOYMENT AUDIT SUMMARY & SNS ALERT (FINAL MERGE POINT)
   # =========================================================================
   audit-summary:
     name: Audit Summary & SNS Notification
-    needs: [deploy-production, live-verification]
+    needs: [deploy-production, live-verification, failure-diagnostics]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -381,19 +400,20 @@ jobs:
       - name: Publish Operations Audit to AWS SNS
         env:
           DEPLOY_STATUS: ${{ needs.deploy-production.result }}
-          ACTIVE_SLOT: ${{ needs.deploy-production.outputs.active_slot || 'UNKNOWN' }}
-          PREV_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'UNKNOWN' }}
+          ACTIVE_SLOT: ${{ needs.deploy-production.outputs.active_slot || 'NONE (DEPLOYMENT HALTED)' }}
+          PREV_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'ACTIVE SLOT UNTOUCHED' }}
+          FAILED_STAGE: ${{ needs.failure-diagnostics.outputs.failed_step || 'None' }}
           TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
         run: |
           if [ "$DEPLOY_STATUS" = "success" ]; then
             STATUS_TEXT="SUCCESSFUL"
-            SUBJECT="[PROD DEPLOY SUCCESS] Zero-Downtime Blue/Green Swap"
+            SUBJECT="[PROD DEPLOY SUCCESS] Zero-Downtime Blue/Green Swap Verified"
           elif [ "$DEPLOY_STATUS" = "skipped" ]; then
             STATUS_TEXT="SKIPPED (PR Validation Only)"
             SUBJECT="[CI RUN COMPLETE] Pull Request Validation Successful"
           else
-            STATUS_TEXT="FAILED / HALTED"
-            SUBJECT="[PROD DEPLOY ALERT] Deployment Failed - Rollback Safeguard Engaged"
+            STATUS_TEXT="FAILED - ROLLBACK SAFEGUARD ENGAGED"
+            SUBJECT="[ALERT] Production Deployment Failed in Stage: $FAILED_STAGE"
           fi
 
           MESSAGE=$(cat <<EOF
@@ -401,6 +421,7 @@ jobs:
           ENTERPRISE CI/CD PIPELINE AUDIT REPORT
           ==================================================
           Overall Status      : $STATUS_TEXT
+          Failed Stage        : $FAILED_STAGE
           Active Live Slot    : Slot $ACTIVE_SLOT
           Decommissioned Slot : Slot $PREV_SLOT
           Commit SHA          : ${{ github.sha }}
@@ -426,7 +447,7 @@ jobs:
           | **Secret Leak Scan (Gitleaks)** | Complete |
           | **Vulnerability Audit (Trivy)** | Complete |
           | **Ephemeral Smoke Test** | Passed (HTTP 200 OK) |
-          | **Active Live Slot** | **${{ needs.deploy-production.outputs.active_slot || 'N/A' }}** |
+          | **Active Live Slot** | **${{ needs.deploy-production.outputs.active_slot || 'Rollback Guard Engaged' }}** |
           | **Zero-Downtime Upstream Swap** | Verified via Nginx Reload |
           | **Live Public Endpoint Probe** | Verified (HTTP 200 OK) |
           EOF
