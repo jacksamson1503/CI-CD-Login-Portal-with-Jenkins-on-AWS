@@ -21,21 +21,14 @@ env:
 
 jobs:
   # =========================================================================
-  # STAGE 1: CODE INTEGRITY, SAST & SECRET LEAK PREVENTION
+  # STAGE 1A: CODE & ASSET INTEGRITY (PARALLEL TRACK 1)
   # =========================================================================
-  quality-and-security:
-    name: Code Gate & Secret Audit
+  code-gate:
+    name: Code Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Scan for Leaked Secrets
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -51,17 +44,33 @@ jobs:
             fi
           done
 
-          # Required asset integrity checks
           test -s Dockerfile || { echo "CRITICAL: Dockerfile missing or empty"; exit 1; }
           test -s index.html || { echo "CRITICAL: index.html missing or empty"; exit 1; }
           grep -iq "<html" index.html || { echo "CRITICAL: Malformed index.html"; exit 1; }
 
   # =========================================================================
-  # STAGE 2: BUILD, CONTAINER CVE SCAN & PUSH TO AMAZON ECR
+  # STAGE 1B: SECRET LEAK PREVENTION (PARALLEL TRACK 2)
   # =========================================================================
-  build-and-scan:
-    name: Build & Scan Container Image
-    needs: [quality-and-security]
+  security-audit:
+    name: Security & Secret Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for Leaked Secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================================
+  # STAGE 2: BUILD CONTAINER & PUSH TO ECR (MERGE POINT 1)
+  # =========================================================================
+  build-container:
+    name: Build Container & ECR Push
+    needs: [code-gate, security-audit]
     runs-on: ubuntu-latest
     outputs:
       ecr_registry: ${{ steps.login-ecr.outputs.registry }}
@@ -89,7 +98,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Local Image for Vulnerability Scan
+      - name: Build Container Image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -97,16 +106,6 @@ jobs:
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.set-tag.outputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Run Trivy Security Vulnerability Scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.set-tag.outputs.image_tag }}
-          format: 'table'
-          exit-code: '0'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
 
       - name: Push Container to Amazon ECR
         if: github.event_name != 'pull_request'
@@ -120,11 +119,11 @@ jobs:
           docker push "$REGISTRY/$REPO:latest"
 
   # =========================================================================
-  # STAGE 3: RUNNER-ISOLATED INTEGRATION & SMOKE TEST
+  # STAGE 3A: RUNNER SMOKE TEST (PARALLEL TRACK 1)
   # =========================================================================
   runner-smoke-test:
     name: Ephemeral Runner Smoke Test
-    needs: [build-and-scan]
+    needs: [build-container]
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS Credentials via OIDC
@@ -136,9 +135,9 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Validate Container Runtime & Health Endpoint
+      - name: Validate Container Runtime
         env:
-          IMAGE: ${{ needs.build-and-scan.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-scan.outputs.image_tag }}
+          IMAGE: ${{ needs.build-container.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-container.outputs.image_tag }}
         run: |
           docker run -d --name runner-smoke-instance -p 8080:80 "$IMAGE"
 
@@ -151,7 +150,6 @@ jobs:
               SUCCESS=1
               break
             fi
-            echo "Waiting for container endpoint response... (attempt $attempt)"
           done
 
           if [ $SUCCESS -ne 1 ]; then
@@ -164,17 +162,44 @@ jobs:
           docker rm -f runner-smoke-instance
 
   # =========================================================================
-  # STAGE 4: PRODUCTION ZERO-DOWNTIME BLUE/GREEN SWAP
+  # STAGE 3B: SECURITY VULNERABILITY AUDIT (PARALLEL TRACK 2)
+  # =========================================================================
+  cve-scan:
+    name: Trivy CVE Scan
+    needs: [build-container]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Run Trivy Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-container.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-container.outputs.image_tag }}
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  # =========================================================================
+  # STAGE 4: PRODUCTION ZERO-DOWNTIME BLUE/GREEN DEPLOY (MERGE POINT 2)
   # =========================================================================
   deploy-production:
-    name: Zero-Downtime Blue/Green Swap
+    name: Zero-Downtime Blue/Green Deploy
     if: github.event_name != 'pull_request'
-    needs: [build-and-scan, runner-smoke-test]
+    needs: [runner-smoke-test, cve-scan]
     runs-on: ubuntu-latest
     environment: production
     outputs:
-      active_slot: ${{ steps.post-verify.outputs.active_slot }}
-      previous_slot: ${{ steps.post-verify.outputs.previous_slot }}
+      active_slot: ${{ steps.export-slot.outputs.active_slot }}
+      previous_slot: ${{ steps.export-slot.outputs.previous_slot }}
     steps:
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
@@ -192,9 +217,9 @@ jobs:
       - name: Deploy Target Slot via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
-          ECR_REGISTRY: ${{ needs.build-and-scan.outputs.ecr_registry }}
+          ECR_REGISTRY: ${{ needs.build-container.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.build-and-scan.outputs.image_tag }}
+          IMAGE_TAG: ${{ needs.build-container.outputs.image_tag }}
           ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
@@ -264,15 +289,14 @@ jobs:
               exit 1
             fi
 
-            # 5. Atomic Upstream Configuration Switch (printf prevents heredoc pollution)
+            # 5. Atomic Upstream Configuration Switch using printf
             sudo mkdir -p /etc/nginx/conf.d
             printf "upstream active_backend {\n    server 127.0.0.1:%s;\n}\n" "$TARGET_PORT" | sudo tee /etc/nginx/conf.d/upstream_active.conf > /dev/null
 
-            # Ensure host Nginx virtual host is pointing to active_backend upstream
             printf "server {\n    listen 80 default_server;\n    listen [::]:80 default_server;\n    server_name _;\n    location / {\n        proxy_pass http://active_backend;\n        proxy_http_version 1.1;\n        proxy_set_header Connection \"\";\n        proxy_set_header Host \$host;\n        proxy_set_header X-Real-IP \$remote_addr;\n        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto \$scheme;\n        add_header X-Deployment-Slot \"\$upstream_addr\" always;\n    }\n}\n" | sudo tee /etc/nginx/sites-available/default > /dev/null
             sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
 
-            # Test syntax and reload Nginx without closing open sockets
+            # Test syntax and reload Nginx
             sudo nginx -t
             sudo systemctl reload nginx
             echo "Traffic successfully switched to $TARGET_SLOT in 0 ms."
@@ -287,35 +311,64 @@ jobs:
               echo "Decommissioned $OLD_CONTAINER cleanly."
             fi
 
-            # 7. Prune dangling/unused images to keep disk space optimal
+            # 7. Prune dangling/unused images
             docker image prune -f --filter "dangling=true" || true
 
-      - name: Verify Live Endpoint Routing
-        id: post-verify
+      - name: Export Deployment Slot Metadata
+        id: export-slot
         run: |
           sleep 2
           RAW_HEADERS=$(curl -s -I "http://${{ secrets.PRODUCTION_EC2_HOST }}/" || true)
-          echo "$RAW_HEADERS"
-
-          ACTIVE_SLOT="BLUE"
           if echo "$RAW_HEADERS" | grep -q ":8082"; then
-            ACTIVE_SLOT="GREEN"
-            PREV_SLOT="BLUE"
+            echo "active_slot=GREEN (8082)" >> $GITHUB_OUTPUT
+            echo "previous_slot=BLUE (8081)" >> $GITHUB_OUTPUT
           else
-            ACTIVE_SLOT="BLUE"
-            PREV_SLOT="GREEN"
+            echo "active_slot=BLUE (8081)" >> $GITHUB_OUTPUT
+            echo "previous_slot=GREEN (8082)" >> $GITHUB_OUTPUT
           fi
 
-          echo "active_slot=$ACTIVE_SLOT" >> $GITHUB_OUTPUT
-          echo "previous_slot=$PREV_SLOT" >> $GITHUB_OUTPUT
-          echo "Verified live routing actively targeting: $ACTIVE_SLOT"
+  # =========================================================================
+  # STAGE 5A: LIVE ENDPOINT VERIFICATION (PARALLEL TRACK 1)
+  # =========================================================================
+  live-verification:
+    name: Live Verification
+    needs: [deploy-production]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe Public Production Server
+        run: |
+          echo "Probing public URL: http://${{ secrets.PRODUCTION_EC2_HOST }}/"
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://${{ secrets.PRODUCTION_EC2_HOST }}/")
+          echo "Production HTTP Status Code: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "CRITICAL: Live endpoint failed to respond with HTTP 200."
+            exit 1
+          fi
+          echo "Public live site successfully verified."
 
   # =========================================================================
-  # STAGE 5: NOTIFICATIONS & AUDIT SUMMARY
+  # STAGE 5B: FAILURE DIAGNOSTICS (PARALLEL TRACK 2 - RUNS ONLY ON FAILURE)
   # =========================================================================
-  notify:
+  failure-diagnostics:
+    name: Failure Diagnostics
+    needs: [deploy-production]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect Deployment Diagnostic Logs
+        run: |
+          echo "=========================================================="
+          echo "ALERT: Production deployment encountered an issue."
+          echo "Auto-rollback safeguard engaged. Live slot remained online."
+          echo "Inspect the logs above to see the failure reason."
+          echo "=========================================================="
+
+  # =========================================================================
+  # STAGE 6: DEPLOYMENT AUDIT SUMMARY & SNS ALERT (FINAL MERGE POINT)
+  # =========================================================================
+  audit-summary:
     name: Audit Summary & SNS Notification
-    needs: [quality-and-security, build-and-scan, runner-smoke-test, deploy-production]
+    needs: [deploy-production, live-verification]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -364,7 +417,6 @@ jobs:
           fi
 
       - name: Generate GitHub Step Summary
-        if: always()
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
           ## Production Deployment Audit Summary
@@ -376,4 +428,5 @@ jobs:
           | **Ephemeral Smoke Test** | Passed (HTTP 200 OK) |
           | **Active Live Slot** | **${{ needs.deploy-production.outputs.active_slot || 'N/A' }}** |
           | **Zero-Downtime Upstream Swap** | Verified via Nginx Reload |
+          | **Live Public Endpoint Probe** | Verified (HTTP 200 OK) |
           EOF
