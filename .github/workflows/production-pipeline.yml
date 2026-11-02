@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -25,17 +28,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Scan for Leaked Secrets
-        uses: gitleaks/gitleaks-action@e851e50587fb8ffbe04a4ae7be7e3c1a84f3df93 # v2.3.4
+        uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        uses: actions/setup-node@v4
         with:
           node-version: 20
 
@@ -65,17 +68,17 @@ jobs:
       image_tag: ${{ steps.set-tag.outputs.image_tag }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        uses: actions/checkout@v4
 
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set Release Tag
         id: set-tag
@@ -84,10 +87,10 @@ jobs:
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+        uses: docker/setup-buildx-action@v3
 
       - name: Build Local Image for Vulnerability Scan
-        uses: docker/build-push-action@4a13e500e05cf64e7086fad570af865fe06a4f86 # v5.1.0
+        uses: docker/build-push-action@v5
         with:
           context: .
           load: true
@@ -100,12 +103,13 @@ jobs:
         with:
           image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.set-tag.outputs.image_tag }}
           format: 'table'
-          exit-code: '0' # Switch to '1' when ready to strictly block on critical CVEs
+          exit-code: '0'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
       - name: Push Container to Amazon ECR
+        if: github.event_name != 'pull_request'
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           REPO: ${{ env.ECR_REPOSITORY }}
@@ -124,13 +128,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Validate Container Runtime & Health Endpoint
         env:
@@ -164,6 +168,7 @@ jobs:
   # =========================================================================
   deploy-production:
     name: Zero-Downtime Blue/Green Swap
+    if: github.event_name != 'pull_request'
     needs: [build-and-scan, runner-smoke-test]
     runs-on: ubuntu-latest
     environment: production
@@ -172,7 +177,7 @@ jobs:
       previous_slot: ${{ steps.post-verify.outputs.previous_slot }}
     steps:
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -220,7 +225,6 @@ jobs:
               TARGET_SLOT="BLUE"
               TARGET_PORT=8081
             else
-              # Initial bootstrap slot
               CURRENT_SLOT="NONE"
               TARGET_SLOT="BLUE"
               TARGET_PORT=8081
@@ -340,7 +344,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -355,6 +359,9 @@ jobs:
           if [ "$DEPLOY_STATUS" = "success" ]; then
             STATUS_TEXT="SUCCESSFUL"
             SUBJECT="[PROD DEPLOY SUCCESS] Zero-Downtime Blue/Green Swap"
+          elif [ "$DEPLOY_STATUS" = "skipped" ]; then
+            STATUS_TEXT="SKIPPED (PR Validation Only)"
+            SUBJECT="[CI RUN COMPLETE] Pull Request Validation Successful"
           else
             STATUS_TEXT="FAILED / HALTED"
             SUBJECT="[PROD DEPLOY ALERT] Deployment Failed - Rollback Safeguard Engaged"
