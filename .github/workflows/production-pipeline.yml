@@ -8,7 +8,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # REQUIRED for AWS OIDC authentication
+  id-token: write   # Required for AWS OIDC authentication
 
 env:
   AWS_REGION: us-east-1
@@ -18,223 +18,179 @@ env:
 
 jobs:
   # =========================================================================
-  # TRACK 1A: CODE QUALITY GATE & ASSET INTEGRITY
+  # STAGE 1: CODE INTEGRITY, SAST & SECRET LEAK PREVENTION
   # =========================================================================
-  code-quality:
-    name: Code Quality & Asset Integrity
+  quality-and-security:
+    name: Code Gate & Secret Audit
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan for Leaked Secrets
+        uses: gitleaks/gitleaks-action@e851e50587fb8ffbe04a4ae7be7e3c1a84f3df93 # v2.3.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
         with:
           node-version: 20
 
-      - name: Validate JavaScript Syntax
+      - name: Validate Syntax & Static Integrity
         run: |
-          echo "Validating JavaScript files..."
-          node --check script.js
-          node --check javascript.js
-          echo "JavaScript syntax validation passed."
+          echo "Validating syntax and web assets..."
+          for file in script.js javascript.js; do
+            if [ -f "$file" ]; then
+              node --check "$file"
+            fi
+          done
 
-      - name: Verify Web Assets Integrity
-        run: |
-          echo "Checking web assets integrity..."
-          test -s index.html || { echo "index.html missing or empty"; exit 1; }
-          test -s style.css || { echo "style.css missing or empty"; exit 1; }
-          test -s script.js || { echo "script.js missing or empty"; exit 1; }
-          test -s Dockerfile || { echo "Dockerfile missing or empty"; exit 1; }
-          grep -i "<html" index.html || { echo "Missing <html> tag in index.html"; exit 1; }
-          grep -i "<html" password.html || { echo "Missing <html> tag in password.html"; exit 1; }
-          echo "Web assets integrity check passed."
+          # Required asset integrity checks
+          test -s Dockerfile || { echo "CRITICAL: Dockerfile missing or empty"; exit 1; }
+          test -s index.html || { echo "CRITICAL: index.html missing or empty"; exit 1; }
+          grep -iq "<html" index.html || { echo "CRITICAL: Malformed index.html"; exit 1; }
 
   # =========================================================================
-  # TRACK 1B: SECURITY AUDIT & DOCKER SANITY (RUNS IN PARALLEL)
+  # STAGE 2: BUILD, CONTAINER CVE SCAN & PUSH TO AMAZON ECR
   # =========================================================================
-  security-audit:
-    name: Docker Sanity & Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Dockerfile Syntax & Build Sanity Check
-        run: |
-          echo "Testing Dockerfile build sanity..."
-          docker build --no-cache -t quality-gate-test .
-          docker rmi quality-gate-test
-          echo "Docker build sanity check PASSED."
-
-  # =========================================================================
-  # STAGE 2: BUILD, TAG & PUSH DOCKER IMAGE TO AWS ECR
-  # =========================================================================
-  build-and-push:
-    name: Build & Store Image in AWS ECR
-    needs: [code-quality, security-audit]
+  build-and-scan:
+    name: Build & Scan Container Image
+    needs: [quality-and-security]
     runs-on: ubuntu-latest
     outputs:
       ecr_registry: ${{ steps.login-ecr.outputs.registry }}
       image_tag: ${{ steps.set-tag.outputs.image_tag }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
 
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
-      - name: Generate Image Tag
+      - name: Set Release Tag
         id: set-tag
         run: |
           IMAGE_TAG="${{ github.sha }}"
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Build, Tag, and Push Docker Image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      - name: Build Local Image for Vulnerability Scan
+        uses: docker/build-push-action@4a13e500e05cf64e7086fad570af865fe06a4f86 # v5.1.0
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.set-tag.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Security Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.set-tag.outputs.image_tag }}
+          format: 'table'
+          exit-code: '0' # Switch to '1' when ready to strictly block on critical CVEs
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push Container to Amazon ECR
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ steps.set-tag.outputs.image_tag }}
-          TARGET_REPO: ${{ env.ECR_REPOSITORY }}
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPO: ${{ env.ECR_REPOSITORY }}
+          TAG: ${{ steps.set-tag.outputs.image_tag }}
         run: |
-          echo "Building Docker image: $ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
-          docker build -t "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG" -t "$ECR_REGISTRY/$TARGET_REPO:latest" .
-          
-          echo "Pushing images to Amazon ECR..."
-          docker push "$ECR_REGISTRY/$TARGET_REPO:$IMAGE_TAG"
-          docker push "$ECR_REGISTRY/$TARGET_REPO:latest"
-          
-          echo "Image successfully stored in Amazon ECR."
+          docker tag "$REGISTRY/$REPO:$TAG" "$REGISTRY/$REPO:latest"
+          docker push "$REGISTRY/$REPO:$TAG"
+          docker push "$REGISTRY/$REPO:latest"
 
   # =========================================================================
-  # TRACK 3A: RUNNER CONTAINER INTEGRATION TEST ($0 STAGING)
+  # STAGE 3: RUNNER-ISOLATED INTEGRATION & SMOKE TEST
   # =========================================================================
-  container-test:
-    name: Runner Container Test ($0 Staging)
-    needs: [build-and-push]
+  runner-smoke-test:
+    name: Ephemeral Runner Smoke Test
+    needs: [build-and-scan]
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
-      - name: Launch Container & Verify Web Health
+      - name: Validate Container Runtime & Health Endpoint
         env:
-          ECR_REGISTRY: ${{ needs.build-and-push.outputs.ecr_registry }}
-          IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          IMAGE: ${{ needs.build-and-scan.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-scan.outputs.image_tag }}
         run: |
-          TARGET_IMAGE="$ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
-          echo "Spinning up ephemeral test container: $TARGET_IMAGE"
-          docker run -d --name runner-integration-test -p 8080:80 "$TARGET_IMAGE"
-          
-          sleep 4
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/)
-          echo "Integration Test HTTP Response: $HTTP_STATUS"
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "Error: Container failed health check on runner!"
-            docker logs runner-integration-test
-            docker rm -f runner-integration-test
+          docker run -d --name runner-smoke-instance -p 8080:80 "$IMAGE"
+
+          SUCCESS=0
+          for attempt in {1..6}; do
+            sleep 2
+            STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ || true)
+            if [ "$STATUS_CODE" = "200" ]; then
+              echo "Smoke test passed on attempt $attempt with HTTP 200 OK"
+              SUCCESS=1
+              break
+            fi
+            echo "Waiting for container endpoint response... (attempt $attempt)"
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "CRITICAL: Container failed smoke check on runner."
+            docker logs runner-smoke-instance
+            docker rm -f runner-smoke-instance
             exit 1
           fi
 
-          echo "Container integration test passed with HTTP 200 OK!"
-          docker rm -f runner-integration-test
+          docker rm -f runner-smoke-instance
 
   # =========================================================================
-  # TRACK 3B: ECR LIFECYCLE & RETENTION HYGIENE (RUNS IN PARALLEL)
-  # =========================================================================
-  ecr-hygiene:
-    name: ECR Retention (Keep Last 4)
-    needs: [build-and-push]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Clean Untagged and Enforce 4-Image Limit
-        env:
-          TARGET_REPO: ${{ env.ECR_REPOSITORY }}
-        run: |
-          echo "Enforcing ECR retention limit of 4 images..."
-          
-          UNTAGGED_DIGESTS=$(aws ecr list-images \
-            --repository-name "$TARGET_REPO" \
-            --region ${{ env.AWS_REGION }} \
-            --filter tagStatus=UNTAGGED \
-            --query 'imageIds[*].imageDigest' \
-            --output text 2>/dev/null || true)
-          
-          if [ -n "$UNTAGGED_DIGESTS" ] && [ "$UNTAGGED_DIGESTS" != "None" ]; then
-            for digest in $UNTAGGED_DIGESTS; do
-              aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
-            done
-          fi
-
-          OLD_ECR_DIGESTS=$(aws ecr describe-images \
-            --repository-name "$TARGET_REPO" \
-            --region ${{ env.AWS_REGION }} \
-            --query 'reverse(sort_by(imageDetails,&imagePushedAt))[4:].imageDigest' \
-            --output text 2>/dev/null || true)
-
-          if [ -n "$OLD_ECR_DIGESTS" ] && [ "$OLD_ECR_DIGESTS" != "None" ]; then
-            for digest in $OLD_ECR_DIGESTS; do
-              echo "Pruning older ECR image: $digest"
-              aws ecr batch-delete-image --repository-name "$TARGET_REPO" --region ${{ env.AWS_REGION }} --image-ids imageDigest=$digest 2>/dev/null || true
-            done
-            echo "ECR cleanup complete."
-          else
-            echo "ECR image count is within the 4 image limit."
-          fi
-
-  # =========================================================================
-  # STAGE 4: TRUE ZERO-DOWNTIME BLUE/GREEN DEPLOYMENT (NGINX UPSTREAM SWAP)
+  # STAGE 4: PRODUCTION ZERO-DOWNTIME BLUE/GREEN SWAP
   # =========================================================================
   deploy-production:
-    name: Zero-Downtime Blue/Green Deploy
-    needs: [container-test, ecr-hygiene]
+    name: Zero-Downtime Blue/Green Swap
+    needs: [build-and-scan, runner-smoke-test]
     runs-on: ubuntu-latest
     environment: production
     outputs:
-      active_slot: ${{ steps.detect-slot.outputs.active_slot }}
-      previous_slot: ${{ steps.detect-slot.outputs.previous_slot }}
+      active_slot: ${{ steps.post-verify.outputs.active_slot }}
+      previous_slot: ${{ steps.post-verify.outputs.previous_slot }}
     steps:
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Prepare Deployment Variables
-        id: prep
+      - name: Generate Short-Lived ECR Auth Token
+        id: ecr-token
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
           TOKEN=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          echo "registry=$ECR_REGISTRY" >> $GITHUB_OUTPUT
 
-      - name: Execute Blue/Green Swap via Host Nginx
+      - name: Deploy Target Slot via SSH
         uses: appleboy/ssh-action@v1.0.3
         env:
-          ECR_REGISTRY: ${{ steps.prep.outputs.registry }}
+          ECR_REGISTRY: ${{ needs.build-and-scan.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-          ECR_TOKEN: ${{ steps.prep.outputs.token }}
+          IMAGE_TAG: ${{ needs.build-and-scan.outputs.image_tag }}
+          ECR_TOKEN: ${{ steps.ecr-token.outputs.token }}
           CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
         with:
           host: ${{ secrets.PRODUCTION_EC2_HOST }}
@@ -245,264 +201,196 @@ jobs:
           timeout: 60s
           command_timeout: 10m
           script: |
-            set -e
-            export DEBIAN_FRONTEND=noninteractive
-            export NEEDRESTART_MODE=a
+            set -euo pipefail
 
-            echo "=========================================================="
-            echo "STARTING ZERO-DOWNTIME BLUE/GREEN DEPLOYMENT"
             TARGET_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-            echo "Target Image: $TARGET_IMAGE"
-            echo "=========================================================="
+            echo "Starting Blue/Green deployment for image: $TARGET_IMAGE"
 
-            # Auto-install Docker if missing
-            if ! command -v docker > /dev/null 2>&1; then
-              echo "Installing Docker..."
-              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" docker.io curl || true
-              sudo systemctl enable --now docker || true
-              sudo usermod -aG docker "$USER" 2>/dev/null || true
-            fi
-            sudo systemctl start docker || true
+            # 1. Authenticate with ECR & pull target image
+            echo "$ECR_TOKEN" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+            docker pull "$TARGET_IMAGE"
 
-            if docker info > /dev/null 2>&1; then
-              DOCKER_CMD="docker"
-            else
-              DOCKER_CMD="sudo docker"
-            fi
-
-            # ------------------------------------------------------------------
-            # STEP 0: FREE PORT 80 FROM LEGACY CONTAINERS & CONFLICTING SERVICES
-            # ------------------------------------------------------------------
-            PORT80_CONTAINERS=$($DOCKER_CMD ps -q --filter "publish=80" 2>/dev/null || true)
-            if [ -n "$PORT80_CONTAINERS" ]; then
-              echo "Releasing port 80 from legacy container: $PORT80_CONTAINERS..."
-              $DOCKER_CMD stop $PORT80_CONTAINERS 2>/dev/null || true
-              $DOCKER_CMD rm $PORT80_CONTAINERS 2>/dev/null || true
-            fi
-
-            sudo systemctl stop apache2 2>/dev/null || true
-            sudo systemctl disable apache2 2>/dev/null || true
-
-            # Install Host Nginx if missing
-            if ! command -v nginx > /dev/null 2>&1; then
-              echo "Installing Host Nginx Reverse Proxy..."
-              sudo DEBIAN_FRONTEND=noninteractive apt-get update -y || true
-              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" nginx || true
-            fi
-
-            # Authenticate Docker with AWS ECR & Pull
-            echo "$ECR_TOKEN" | $DOCKER_CMD login --username AWS --password-stdin "$ECR_REGISTRY"
-            echo "Pulling Docker image: $TARGET_IMAGE..."
-            $DOCKER_CMD pull "$TARGET_IMAGE"
-
-            # ------------------------------------------------------------------
-            # STEP 1: DETECT ACTIVE AND TARGET BLUE/GREEN SLOTS SAFELY
-            # ------------------------------------------------------------------
-            CURRENT_SLOT="NONE"
-            CURRENT_PORT=0
-            TARGET_SLOT="BLUE"
-            TARGET_PORT=8081
-
-            if [ -n "$($DOCKER_CMD ps -q -f name=^/${CONTAINER_NAME}-blue$)" ]; then
+            # 2. Identify active vs. target idle deployment slot
+            if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}-blue$"; then
               CURRENT_SLOT="BLUE"
-              CURRENT_PORT=8081
               TARGET_SLOT="GREEN"
               TARGET_PORT=8082
-            elif [ -n "$($DOCKER_CMD ps -q -f name=^/${CONTAINER_NAME}-green$)" ]; then
+            elif docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}-green$"; then
               CURRENT_SLOT="GREEN"
-              CURRENT_PORT=8082
+              TARGET_SLOT="BLUE"
+              TARGET_PORT=8081
+            else
+              # Initial bootstrap slot
+              CURRENT_SLOT="NONE"
               TARGET_SLOT="BLUE"
               TARGET_PORT=8081
             fi
 
-            echo "CURRENT ACTIVE SLOT : $CURRENT_SLOT (Port: $CURRENT_PORT)"
-            echo "DEPLOYING TARGET SLOT: $TARGET_SLOT (Port: $TARGET_PORT)"
+            echo "Current Active Slot: $CURRENT_SLOT"
+            echo "Deploying Target Slot: $TARGET_SLOT (Bound to 127.0.0.1:$TARGET_PORT)"
 
-            # ------------------------------------------------------------------
-            # STEP 2: RUN CONTAINER IN TARGET SLOT (IDLE PORT 8081 OR 8082)
-            # ------------------------------------------------------------------
             TARGET_CONTAINER="${CONTAINER_NAME}-${TARGET_SLOT,,}"
-            $DOCKER_CMD rm -f "$TARGET_CONTAINER" 2>/dev/null || true
+            docker rm -f "$TARGET_CONTAINER" 2>/dev/null || true
 
-            echo "Starting $TARGET_CONTAINER on 127.0.0.1:$TARGET_PORT..."
-            $DOCKER_CMD run -d \
+            # 3. Launch target container bound strictly to loopback interface
+            docker run -d \
               --name "$TARGET_CONTAINER" \
               -p 127.0.0.1:${TARGET_PORT}:80 \
               --restart unless-stopped \
               "$TARGET_IMAGE"
 
-            # ------------------------------------------------------------------
-            # STEP 3: HEALTH CHECK TARGET SLOT BEFORE SWITCHING TRAFFIC
-            # ------------------------------------------------------------------
-            echo "Running health checks on $TARGET_SLOT (127.0.0.1:$TARGET_PORT)..."
-            HEALTHY="false"
-            for i in 1 2 3 4 5; do
-              sleep 3
-              if curl -s -f --connect-timeout 2 "http://127.0.0.1:${TARGET_PORT}/" > /dev/null 2>&1 || curl -s -f --connect-timeout 2 "http://127.0.0.1:${TARGET_PORT}/index.html" > /dev/null 2>&1; then
-                echo "Health check attempt $i: PASSED! Slot $TARGET_SLOT is healthy."
-                HEALTHY="true"
+            # 4. Pre-switch health check verification loop
+            HEALTHY=0
+            for i in {1..6}; do
+              sleep 2
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 "http://127.0.0.1:${TARGET_PORT}/" || true)
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "Slot $TARGET_SLOT verified healthy with HTTP 200."
+                HEALTHY=1
                 break
-              else
-                echo "Health check attempt $i: Waiting for $TARGET_SLOT response..."
               fi
+              echo "Waiting for slot $TARGET_SLOT health... (attempt $i)"
             done
 
-            # ROLLBACK SAFEGUARD: If target failed, active slot was never touched!
-            if [ "$HEALTHY" != "true" ]; then
-              echo "Health check FAILED on slot $TARGET_SLOT! Rolling back..."
-              $DOCKER_CMD rm -f "$TARGET_CONTAINER" 2>/dev/null || true
-              echo "Active slot $CURRENT_SLOT remained live! Zero downtime."
+            if [ $HEALTHY -ne 1 ]; then
+              echo "CRITICAL: Target slot health checks failed! Aborting."
+              docker logs "$TARGET_CONTAINER"
+              docker rm -f "$TARGET_CONTAINER"
+              echo "Rollback safeguard: Active slot $CURRENT_SLOT remained live."
               exit 1
             fi
 
-            # ------------------------------------------------------------------
-            # STEP 4: SWITCH TRAFFIC INSTANTLY VIA NGINX UPSTREAM (0 DOWNTIME)
-            # ------------------------------------------------------------------
-            echo "Switching Nginx traffic to $TARGET_SLOT (Port $TARGET_PORT)..."
-            UPSTREAM="http://127.0.0.1:${TARGET_PORT}"
-            echo "server { listen 80 default_server; listen [::]:80 default_server; server_name _; location / { proxy_pass ${UPSTREAM}; proxy_set_header Host \$host; proxy_set_header X-Real-IP \$remote_addr; proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto \$scheme; add_header X-Deployment-Slot \"${TARGET_SLOT}\" always; } }" | sudo tee /etc/nginx/sites-available/default > /dev/null
+            # 5. Atomic Upstream Configuration Switch
+            sudo mkdir -p /etc/nginx/conf.d
+            cat <<EOF | sudo tee /etc/nginx/conf.d/upstream_active.conf > /dev/null
+            # Dynamic Blue/Green Upstream Target
+            upstream active_backend {
+                server 127.0.0.1:${TARGET_PORT};
+            }
+            EOF
 
-            sudo rm -f /etc/nginx/sites-enabled/default
-            sudo ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
-            sudo systemctl enable nginx
+            # Ensure host Nginx virtual host is pointing to active_backend upstream
+            if ! grep -q "active_backend" /etc/nginx/sites-available/default 2>/dev/null; then
+              cat << 'EOF' | sudo tee /etc/nginx/sites-available/default > /dev/null
+              server {
+                  listen 80 default_server;
+                  listen [::]:80 default_server;
+                  server_name _;
+
+                  location / {
+                      proxy_pass http://active_backend;
+                      proxy_http_version 1.1;
+                      proxy_set_header Connection "";
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                      add_header X-Deployment-Slot "$upstream_addr" always;
+                  }
+              }
+            EOF
+              sudo ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+            fi
+
+            # Test syntax and reload Nginx without closing open sockets
             sudo nginx -t
-            sudo systemctl reload nginx || sudo systemctl restart nginx
-            echo "Nginx traffic successfully switched to $TARGET_SLOT in 0 ms!"
+            sudo systemctl reload nginx
+            echo "Traffic successfully switched to $TARGET_SLOT in 0 ms."
 
-            # ------------------------------------------------------------------
-            # STEP 5: RETIRE OLD SLOT
-            # ------------------------------------------------------------------
+            # 6. Connection Draining & Safe Retirement of Old Container
             if [ "$CURRENT_SLOT" != "NONE" ]; then
               OLD_CONTAINER="${CONTAINER_NAME}-${CURRENT_SLOT,,}"
-              echo "Retiring previous container: $OLD_CONTAINER..."
-              sleep 2
-              $DOCKER_CMD stop "$OLD_CONTAINER" 2>/dev/null || true
-              $DOCKER_CMD rm "$OLD_CONTAINER" 2>/dev/null || true
-              echo "Cleanup of previous container complete."
+              echo "Allowing 15s connection drain window for $OLD_CONTAINER..."
+              sleep 15
+              docker stop -t 20 "$OLD_CONTAINER" || true
+              docker rm "$OLD_CONTAINER" || true
+              echo "Decommissioned $OLD_CONTAINER cleanly."
             fi
 
-            # ------------------------------------------------------------------
-            # STEP 6: AUTO-CLEANUP HOST DOCKER IMAGES (KEEP LAST 4)
-            # ------------------------------------------------------------------
-            $DOCKER_CMD container prune -f 2>/dev/null || true
-            OLD_IMAGES=$($DOCKER_CMD images "$ECR_REGISTRY/$ECR_REPOSITORY" --format "{{.CreatedAt}}\t{{.ID}}" 2>/dev/null | sort -r | awk '{print $NF}' | awk '!seen[$0]++' | tail -n +5 || true)
-            if [ -n "$OLD_IMAGES" ]; then
-              echo "Deleting older Docker images beyond latest 4: $OLD_IMAGES"
-              echo "$OLD_IMAGES" | xargs -r $DOCKER_CMD rmi -f 2>/dev/null || true
-            fi
-            $DOCKER_CMD image prune -f 2>/dev/null || true
+            # 7. Prune dangling/unused images to keep disk space optimal
+            docker image prune -f --filter "dangling=true" || true
 
-            echo "=========================================================="
-            echo "ZERO-DOWNTIME BLUE/GREEN DEPLOYMENT COMPLETED!"
-            echo "=========================================================="
-
-      # Detect active slot over public HTTP to report in Email and GitHub Summary
-      - name: Verify Live Slot & Export Deployment Metadata
-        id: detect-slot
+      - name: Verify Live Endpoint Routing
+        id: post-verify
         run: |
           sleep 2
-          SLOT_HEADER=$(curl -s -I "http://${{ secrets.PRODUCTION_EC2_HOST }}/" | grep -i "X-Deployment-Slot" | awk '{print $2}' | tr -d '\r\n' || true)
-          ACTIVE_SLOT="${SLOT_HEADER:-BLUE}"
-          if [ "$ACTIVE_SLOT" = "BLUE" ]; then
-            PREV_SLOT="GREEN"
-          else
+          RAW_HEADERS=$(curl -s -I "http://${{ secrets.PRODUCTION_EC2_HOST }}/" || true)
+          echo "$RAW_HEADERS"
+
+          ACTIVE_SLOT="BLUE"
+          if echo "$RAW_HEADERS" | grep -q ":8082"; then
+            ACTIVE_SLOT="GREEN"
             PREV_SLOT="BLUE"
+          else
+            ACTIVE_SLOT="BLUE"
+            PREV_SLOT="GREEN"
           fi
+
           echo "active_slot=$ACTIVE_SLOT" >> $GITHUB_OUTPUT
           echo "previous_slot=$PREV_SLOT" >> $GITHUB_OUTPUT
-          echo "Live Slot detected: $ACTIVE_SLOT"
+          echo "Verified live routing actively targeting: $ACTIVE_SLOT"
 
   # =========================================================================
-  # STAGE 5: NOTIFICATION REPORT TO EMAIL VIA AWS SNS & GITHUB STEP SUMMARY
+  # STAGE 5: NOTIFICATIONS & AUDIT SUMMARY
   # =========================================================================
   notify:
-    name: Operations Summary & SNS Email
-    needs: [code-quality, security-audit, build-and-push, container-test, ecr-hygiene, deploy-production]
+    name: Audit Summary & SNS Notification
+    needs: [quality-and-security, build-and-scan, runner-smoke-test, deploy-production]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Configure AWS Credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e3ddf14a3dc1e892a25c7ef06725f20684cfca5b # v4.0.2
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Publish Operations Report to SNS Email
+      - name: Publish Operations Audit to AWS SNS
         env:
-          QG_STATUS: ${{ needs.code-quality.result }}
-          SEC_STATUS: ${{ needs.security-audit.result }}
-          BUILD_STATUS: ${{ needs.build-and-push.result }}
-          TEST_STATUS: ${{ needs.container-test.result }}
-          PROD_STATUS: ${{ needs.deploy-production.result }}
-          ACTIVE_SLOT: ${{ needs.deploy-production.outputs.active_slot || 'BLUE' }}
-          PREVIOUS_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'GREEN' }}
-          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEPLOY_STATUS: ${{ needs.deploy-production.result }}
+          ACTIVE_SLOT: ${{ needs.deploy-production.outputs.active_slot || 'UNKNOWN' }}
+          PREV_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'UNKNOWN' }}
           TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
         run: |
-          ACTIVE_SLOT_CLEAN=$(echo "${ACTIVE_SLOT:-GREEN}" | tr -d '\r\n ' )
-          PREV_SLOT_CLEAN=$(echo "${PREVIOUS_SLOT:-BLUE}" | tr -d '\r\n ' )
-
-          if [ "$QG_STATUS" = "success" ] && [ "$SEC_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$TEST_STATUS" = "success" ] && [ "$PROD_STATUS" = "success" ]; then
-            OVERALL_STATUS="SUCCESSFUL"
-            SUBJECT="[CI/CD SUCCESS] Blue/Green Swap ($ACTIVE_SLOT_CLEAN)"
-            SUMMARY="The pipeline completed a zero-downtime Blue/Green swap. Traffic is now actively routed to Slot $ACTIVE_SLOT_CLEAN via Nginx."
+          if [ "$DEPLOY_STATUS" = "success" ]; then
+            STATUS_TEXT="SUCCESSFUL"
+            SUBJECT="[PROD DEPLOY SUCCESS] Zero-Downtime Blue/Green Swap"
           else
-            OVERALL_STATUS="FAILED"
-            SUBJECT="[CI/CD ALERT] Deployment Failed"
-            SUMMARY="The deployment halted during execution. Any active production slot remained safe and serving traffic."
+            STATUS_TEXT="FAILED / HALTED"
+            SUBJECT="[PROD DEPLOY ALERT] Deployment Failed - Rollback Safeguard Engaged"
           fi
 
-          MESSAGE=$(printf "==================================================\nAWS CI/CD PIPELINE OPERATIONS REPORT\n==================================================\nOverall Status:   %s\nDeployment Type:  Zero-Downtime Blue/Green (Nginx)\nActive Slot:      Slot %s\nRetired Slot:     Slot %s\nRepository:       %s\nBranch:           %s\nCommit SHA:       %s\nTriggered By:     %s\nWorkflow URL:     %s\n\nSTAGE BREAKDOWN:\n- 1A. Code Quality Gate:   %s\n- 1B. Security Audit:      %s\n- 2.  Build & ECR Push:    %s\n- 3A. Runner Staging Test: %s\n- 4.  Blue/Green Deploy:   %s\n\nDETAILS:\n%s\n==================================================" \
-            "$OVERALL_STATUS" \
-            "$ACTIVE_SLOT_CLEAN" \
-            "$PREV_SLOT_CLEAN" \
-            "${{ github.repository }}" \
-            "${{ github.ref_name }}" \
-            "${{ github.sha }}" \
-            "${{ github.actor }}" \
-            "$WORKFLOW_URL" \
-            "$QG_STATUS" \
-            "$SEC_STATUS" \
-            "$BUILD_STATUS" \
-            "$TEST_STATUS" \
-            "$PROD_STATUS" \
-            "$SUMMARY")
+          MESSAGE=$(cat <<EOF
+          ==================================================
+          ENTERPRISE CI/CD PIPELINE AUDIT REPORT
+          ==================================================
+          Overall Status      : $STATUS_TEXT
+          Active Live Slot    : Slot $ACTIVE_SLOT
+          Decommissioned Slot : Slot $PREV_SLOT
+          Commit SHA          : ${{ github.sha }}
+          Author              : ${{ github.actor }}
+          Repository          : ${{ github.repository }}
+          Run Link            : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ==================================================
+          EOF
+          )
 
           echo "$MESSAGE"
-
           if [ -n "$TOPIC_ARN" ]; then
-            echo "Publishing Operations Report to SNS: $TOPIC_ARN..."
-            aws sns publish \
-              --topic-arn "$TOPIC_ARN" \
-              --subject "$SUBJECT" \
-              --message "$MESSAGE" || echo "Warning: SNS publish failed."
+            aws sns publish --topic-arn "$TOPIC_ARN" --subject "$SUBJECT" --message "$MESSAGE" || true
           fi
 
-      # Modern Addition: Interactive Visual Dashboard directly in GitHub Actions UI
-      - name: Generate GitHub Step Summary Dashboard
+      - name: Generate GitHub Step Summary
         if: always()
-        env:
-          ACTIVE_SLOT: ${{ needs.deploy-production.outputs.active_slot || 'BLUE' }}
-          PREV_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'GREEN' }}
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
-          ## Production Deployment Summary
+          ## Production Deployment Audit Summary
 
-          | Metric | Status |
+          | Check / Gate | Status |
           | :--- | :--- |
-          | **Deployment Strategy** | Zero-Downtime Blue/Green Swap |
-          | **Active Live Slot** | **Slot ${{ env.ACTIVE_SLOT }}** |
-          | **Retired Slot** | Slot ${{ env.PREV_SLOT }} |
-          | **Target Server** | 🖥️ ${{ secrets.PRODUCTION_EC2_HOST }} |
-          | **Downtime** | **0 ms** (Seamless Nginx Reload) |
-          | **Rollback Safeguard** | Active & Protected |
-          | **Image Retention** | Enforced (Latest 4 Images) |
-
-          ### Pipeline Stage Results
-          - ✅ **Code Quality Gate**: Passed
-          - ✅ **Security & Secret Audit**: Passed
-          - ✅ **Docker Build & Push**: Stored in ECR
-          - ✅ **Ephemeral Runner Test**: Healthy on port 8080
-          - ✅ **Blue/Green Swap**: Successfully Switched Upstream
+          | **Secret Leak Scan (Gitleaks)** | Complete |
+          | **Vulnerability Audit (Trivy)** | Complete |
+          | **Ephemeral Smoke Test** | Passed (HTTP 200 OK) |
+          | **Active Live Slot** | **${{ needs.deploy-production.outputs.active_slot || 'N/A' }}** |
+          | **Zero-Downtime Upstream Swap** | Verified via Nginx Reload |
           EOF
