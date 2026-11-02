@@ -334,6 +334,7 @@ jobs:
     name: Live Verification
     needs: [deploy-production]
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - name: Probe Public Production Server
         run: |
@@ -351,7 +352,7 @@ jobs:
   # =========================================================================
   failure-diagnostics:
     name: Failure Diagnostics
-    needs: [code-gate, security-audit, build-container, runner-smoke-test, cve-scan, deploy-production]
+    needs: [code-gate, security-audit, build-container, runner-smoke-test, cve-scan, deploy-production, live-verification]
     if: failure()
     runs-on: ubuntu-latest
     outputs:
@@ -368,6 +369,7 @@ jobs:
           echo "Runner Smoke Test: ${{ needs.runner-smoke-test.result }}"
           echo "Trivy CVE Scan: ${{ needs.cve-scan.result }}"
           echo "Deploy Production: ${{ needs.deploy-production.result }}"
+          echo "Live Verification: ${{ needs.live-verification.result }}"
           echo "=========================================================="
           
           FAILED="UNKNOWN"
@@ -377,6 +379,7 @@ jobs:
           elif [ "${{ needs.runner-smoke-test.result }}" = "failure" ]; then FAILED="Runner Smoke Test";
           elif [ "${{ needs.cve-scan.result }}" = "failure" ]; then FAILED="Trivy CVE Scan";
           elif [ "${{ needs.deploy-production.result }}" = "failure" ]; then FAILED="Zero-Downtime Blue/Green Deploy";
+          elif [ "${{ needs.live-verification.result }}" = "failure" ]; then FAILED="Live Verification";
           fi
 
           echo "failed_step=$FAILED" >> $GITHUB_OUTPUT
@@ -400,12 +403,13 @@ jobs:
       - name: Publish Operations Audit to AWS SNS
         env:
           DEPLOY_STATUS: ${{ needs.deploy-production.result }}
+          VERIFY_STATUS: ${{ needs.live-verification.result }}
           ACTIVE_SLOT: ${{ needs.deploy-production.outputs.active_slot || 'NONE (DEPLOYMENT HALTED)' }}
           PREV_SLOT: ${{ needs.deploy-production.outputs.previous_slot || 'ACTIVE SLOT UNTOUCHED' }}
           FAILED_STAGE: ${{ needs.failure-diagnostics.outputs.failed_step || 'None' }}
           TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
         run: |
-          if [ "$DEPLOY_STATUS" = "success" ]; then
+          if [ "$DEPLOY_STATUS" = "success" ] && [ "$VERIFY_STATUS" = "success" ]; then
             STATUS_TEXT="SUCCESSFUL"
             SUBJECT="[PROD DEPLOY SUCCESS] Zero-Downtime Blue/Green Swap Verified"
           elif [ "$DEPLOY_STATUS" = "skipped" ]; then
